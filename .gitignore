@@ -1,0 +1,33 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Candidate-specific data and generated delivery records
+resume.md
+resume.*
+candidate_profile*.json
+resume_digest*.json
+interview_draft*.json
+job_profiles*.json
+*job_profiles*.json
+*.csv
+deliver_log*.json
+nonexistent_job_profiles.json
+*.bak
+
+# Browser/session data and downloaded website snapshots
+网页示例/
+投递/
+screenshots/
+.screenshots/
+
+# Local tool state, Python caches, and temporary files
+.codegraph/*
+!.codegraph/.gitignore
+.trae/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.tmp/
+*.log

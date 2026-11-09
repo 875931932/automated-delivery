@@ -1,6 +1,7 @@
 """BOSS web/geek/jobs filter labels and query codes."""
 
 import re
+from urllib.parse import parse_qs, urlsplit
 
 JOB_TYPE_CODES = {"全职": "1901", "实习": "1902", "兼职": "1903"}
 JOB_TYPE_LABELS = {code: label for label, code in JOB_TYPE_CODES.items()}
@@ -90,7 +91,21 @@ def resolve_platform_filter(field_key, value):
     if not raw or raw == "不限":
         return ""
     if field_key == "PLATFORM_INDUSTRY":
-        return raw if re.fullmatch(r"\d+", raw) else ""
+        if raw.startswith(("http://", "https://")):
+            parsed_url = urlsplit(raw)
+            hostname = (parsed_url.hostname or "").lower()
+            if not (hostname == "zhipin.com" or hostname.endswith(".zhipin.com")):
+                return ""
+            if parsed_url.path.rstrip("/") != "/web/geek/jobs":
+                return ""
+            raw = ",".join(parse_qs(parsed_url.query).get("industry", []))
+
+        industry_ids = [item.strip() for item in raw.split(",")]
+        if not industry_ids or any(
+            not re.fullmatch(r"\d+", industry_id) for industry_id in industry_ids
+        ):
+            return ""
+        return ",".join(dict.fromkeys(industry_ids))
     definition = PLATFORM_FILTERS.get(field_key)
     if not definition or not definition[2]:
         return ""

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """投递配置：.env 加载、DELIVER_CONFIG、平台检索配置与匹配前置校验。"""
 import os
-from dotenv import load_dotenv
 
+from dotenv import dotenv_values, load_dotenv
+
+from app_paths import get_data_dir, get_resource_dir
 from candidate_profiles import (
     CandidateProfileStore,
     build_base_candidate_profile,
@@ -17,20 +19,19 @@ from job_profiles import (
     load_screening_rules,
 )
 
-from boss_spider import (
-    Config as SpiderConfig,
-    build_job_search_url,
-    resolve_platform_area_codes,
-)
 from platform_search_filters import (
     JOB_TYPE_CODES,
     JOB_TYPE_LABELS,
     PLATFORM_FILTERS,
     resolve_platform_filter,
 )
+from greeting_prompt import DEFAULT_GREETING_PROMPT
 
 # ========================= 从 .env 加载配置 =========================
-load_dotenv()
+_inherited_greeting_prompt = os.environ.get("GREETING_PROMPT")
+_env_file = get_data_dir() / ".env"
+load_dotenv(_env_file)
+_raw_env = dotenv_values(_env_file, interpolate=False)
 
 
 def _env_str(key: str, default: str) -> str:
@@ -55,6 +56,13 @@ DELIVER_CONFIG = {
     "ai_reasoning_effort": _env_str("AI_REASONING_EFFORT", "low").lower(),
     "ai_timeout": _env_int("AI_TIMEOUT", 90),
     "ai_max_retries": _env_int("AI_MAX_RETRIES", 2),
+    "greeting_prompt": (
+        _inherited_greeting_prompt
+        if _inherited_greeting_prompt is not None
+        else _raw_env.get(
+            "GREETING_PROMPT", os.getenv("GREETING_PROMPT", DEFAULT_GREETING_PROMPT)
+        )
+    ) or DEFAULT_GREETING_PROMPT,
     # Tavily 仅用于候选人画像访谈的 market_followup 阶段（panel_candidate_profile.py）。
     # 主投递链路（auto_deliver.py）不调用 Tavily；未配置 key 时访谈自动降级为纯简历访谈。
     "tavily_enabled": os.getenv("TAVILY_ENABLED", "true").strip().lower() == "true",
@@ -74,7 +82,7 @@ DELIVER_CONFIG = {
     # 本地廉价 gate 影子模式：hard_conflict 只记录不拦截（误杀率 <5% 后可关闭影子）
     "local_gate_shadow": os.getenv("LOCAL_GATE_SHADOW", "true").strip().lower() == "true",
     "deliver_keyword": _env_str("DELIVER_KEYWORD", "AI应用开发"),
-    "deliver_max_pages": max(1, _env_int("DELIVER_MAX_PAGES", 3)),  # 每轮最少采集1页
+    "deliver_max_pages": min(50, max(1, _env_int("DELIVER_MAX_PAGES", 10))),  # 每轮搜索请求总上限
     "candidate_profile_file": _env_str("CANDIDATE_PROFILE_FILE", "candidate_profile.json"),
     "job_profiles_file": _env_str("JOB_PROFILES_FILE", "job_profiles.json"),
     "screening_rules_file": _env_str("SCREENING_RULES_FILE", "screening_rules.md"),
@@ -101,10 +109,11 @@ DELIVER_CONFIG = {
 
     # --- 拟人行为 ---
     "humanize_enable": os.getenv("HUMANIZE_ENABLE", "true").strip().lower() == "true",
-    "favorite_score": _env_int("FAVORITE_SCORE", 75),      # 心跳收藏只收 AI 匹配分高于该值的岗位
+    "favorite_score": _env_int("FAVORITE_SCORE", 75),      # 兼容旧配置；当前流程不自动收藏
 
     # --- 登录与浏览节奏 ---
     "keep_login": os.getenv("KEEP_LOGIN", "true").strip().lower() == "true",
+    "browser_background": os.getenv("BROWSER_BACKGROUND", "true").strip().lower() == "true",
     "detail_delay": (_env_int("DETAIL_DELAY_MIN", 3), _env_int("DETAIL_DELAY_MAX", 6)),
 
     # --- 输出 ---
@@ -126,8 +135,8 @@ DELIVER_CONFIG = {
 
     # --- 测试模式 ---
     "dry_run": os.getenv("DRY_RUN", "false").strip().lower() == "true",
-    "test_limit": _env_int("TEST_LIMIT", 0),   # 本轮最多处理几个岗位，0=不限
-    "login_wait": _env_int("LOGIN_WAIT", 0),   # >0 时跳过回车确认，等待指定秒数
+    "test_limit": _env_int("TEST_LIMIT", 0),   # 本轮 AI 评估尝试数，0=不限
+    "login_wait": _env_int("LOGIN_WAIT", 0),   # >0 时超时停止；0 持续等待登录
 }
 
 
@@ -136,11 +145,15 @@ def apply_search_settings(config, spider_config):
     spider_config["city_id"] = _env_str("CITY_CODE", "101280600")
     spider_config["keyword"] = config["deliver_keyword"]
     spider_config["keep_login"] = config["keep_login"]
+    spider_config["browser_background"] = config.get("browser_background", True)
     spider_config["start_url"] = configure_platform_search(config, spider_config)
     return spider_config["start_url"]
 
 def configure_platform_search(config, spider_config):
     """Apply optional platform filters and return the matching browser search URL."""
+    # 延迟导入 boss_spider：它会连带加载 DrissionPage，冷启动时不需要这份开销。
+    from boss_spider import build_job_search_url, resolve_platform_area_codes
+
     city_id = spider_config["city_id"]
     areas = config.get("platform_area_filter", [])
     spider_config["multiBusinessDistrict"] = (
@@ -183,7 +196,7 @@ def load_matching_config(config: dict):
         作用：补充岗位市场资料，帮助访谈助手提出更有针对性的问题
     ─────────────────────────────────────────────────────────────────
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = str(get_data_dir())
 
     def local_path(key: str, default: str) -> str:
         value = config.get(key) or default
@@ -260,11 +273,27 @@ def load_matching_config(config: dict):
     active_profiles = [item for item in profiles if item.enabled]
     if not active_profiles:
         raise ValueError("没有可用的岗位方向，请检查「求职设置」里的目标岗位。")
-    allocations = allocate_query_pages(
-        build_unique_queries(active_profiles), int(config.get("deliver_max_pages", 0))
-    )
+    queries = build_unique_queries(active_profiles)
+    target = max(0, int(config.get("test_limit", 0) or 0))
+    allocations = allocate_query_pages(queries, len(queries))
+    if len(queries) > 50:
+        raise ValueError(
+            f"唯一搜索关键词有 {len(queries)} 个，超过每轮 50 次搜索请求安全上限。"
+        )
+    page_cap = max(1, int(config.get("deliver_max_pages", 10) or 10))
+    if not target and page_cap < len(queries):
+        raise ValueError(
+            f"搜索请求上限 {page_cap} 小于唯一关键词数 {len(queries)}，"
+            "请提高高级设置中的请求预算，确保每个关键词至少搜索一页。"
+        )
     rules_value = config.get("screening_rules_file") or str(DEFAULT_SCREENING_RULES_PATH)
-    rules_path = rules_value if os.path.isabs(rules_value) else os.path.join(base_dir, rules_value)
+    if os.path.isabs(rules_value):
+        rules_path = rules_value
+    else:
+        rules_path = os.path.join(base_dir, rules_value)
+        bundled_rules = get_resource_dir() / rules_value
+        if not os.path.isfile(rules_path) and bundled_rules.is_file():
+            rules_path = str(bundled_rules)
     rules = load_screening_rules(rules_path)
     mode_label = "基础模式（无已确认候选人画像）" if base_mode else "增强模式（已确认候选人画像）"
     print(f"[配置] 运行模式：{mode_label}")
@@ -272,9 +301,6 @@ def load_matching_config(config: dict):
             "allocations": allocations, "rules": rules, "base_mode": base_mode,
             "enhanced_profile_stale": enhanced_profile_stale}
 
-
-# Keep the browser landing/recovery page and API search on the same filters.
-apply_search_settings(DELIVER_CONFIG, SpiderConfig)
 
 if not DELIVER_CONFIG["ai_api_key"] or "你的key" in DELIVER_CONFIG["ai_api_key"]:
     print("[配置] ⚠️ 尚未在 .env 中填写 AI_API_KEY，AI 匹配将无法工作")

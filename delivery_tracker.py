@@ -33,8 +33,10 @@ class DeliveryTracker:
     def can_deliver(self, daily_limit: int) -> bool:
         return self.data["count"] < daily_limit
 
-    def mark(self, job_id: str, job_name: str, greeting: str, status: str):
-        self.data["count"] += 1
+    def mark(self, job_id: str, job_name: str, greeting: str, status: str,
+             *, count_delivery: bool = True):
+        if count_delivery:
+            self.data["count"] += 1
         self.data["delivered"][job_id] = {
             "name": job_name, "greeting": greeting, "status": status,
         }

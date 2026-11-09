@@ -31,3 +31,9 @@ __pycache__/
 *.py[cod]
 .tmp/
 *.log
+
+# Build products and browser automation captures
+build/
+dist/
+release/
+.playwright-cli/

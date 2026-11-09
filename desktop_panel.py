@@ -7,8 +7,12 @@
   - 一键启动 / 停止投递任务（子进程运行 auto_deliver.py）
   - 实时日志窗口 + 投递结果表 + 今日进度
 
-启动: D:\\ProgramData\\miniconda3\\envs\\autodeliver\\python.exe desktop_panel.py
+启动: 双击项目内的「启动面板.vbs」。
 """
+from process_runtime import configure_quiet_processes
+
+configure_quiet_processes()
+
 import csv
 import difflib
 import json
@@ -34,36 +38,37 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QCompleter,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLayout,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
-    QTabWidget,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from dotenv import dotenv_values
 
+from app_paths import get_data_dir
 from candidate_profiles import (
     CandidateProfileService,
     CandidateProfileStore,
@@ -72,6 +77,7 @@ from candidate_profiles import (
     ResumeDigestStore,
     resume_digest_hash,
 )
+from greeting_prompt import DEFAULT_GREETING_PROMPT
 from job_type_logic import normalize_job_type_preference, transition_job_type_preference
 from panel_config_logic import CONFIG_WARNINGS, INT_LIMITS, parse_hhmm, validate_config_values
 from panel_log_parser import (
@@ -84,18 +90,36 @@ from panel_log_parser import (
     parse_filter_stats,
     parse_job_line,
 )
-from panel_runner import TaskRunner
+from panel_runner import TaskRunner, format_exit_status
+from panel_about import AboutDialog
 from panel_styles import ASSETS_DIR, STYLESHEET
-from panel_widgets import FlowLayout, WidgetHelpersMixin
-from platform_search_filters import platform_filter_options, platform_filter_label
+from panel_widgets import (
+    ClickableLabel,
+    FieldBlock,
+    FlowLayout,
+    FormGrid,
+    SectionCard,
+    StatTile,
+    StatusDot,
+    ToastNotice,
+    ToggleRow,
+    WidgetHelpersMixin,
+    pad_spinbox_text,
+)
+from platform_search_filters import (
+    platform_filter_options,
+    platform_filter_label,
+    resolve_platform_filter,
+)
 from platform_locations import fetch_platform_districts, load_city_codes
+from platform_industries import fetch_platform_industries
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = get_data_dir()
 ENV_FILE = BASE_DIR / ".env"
 LOG_JSON = BASE_DIR / "deliver_log.json"
 
 # 配置项定义: (key, 分组tab, 标签, 类型, 默认值, 备注)
-# 类型: text / int / password / bool / select / multiselect
+# 类型: text / multiline / int / password / bool / select / multiselect
 FIELDS = [
     ("AI_BASE_URL",    "AI 接口", "接口地址", "text", "https://api.deepseek.com/v1", "OpenAI 兼容接口，如 https://api.stepfun.com/step_plan/v1"),
     ("AI_API_KEY",     "AI 接口", "API Key", "password", "", ""),
@@ -103,6 +127,9 @@ FIELDS = [
     ("AI_REASONING_EFFORT", "AI 接口", "思考强度", "select", "low", "low/medium/high；访谈和评分用 low 最快，high 会慢数倍"),
     ("AI_TIMEOUT",     "AI 接口", "请求超时(秒)", "int", "90", ""),
     ("AI_MAX_RETRIES", "AI 接口", "失败重试次数", "int", "2", ""),
+    ("GREETING_PROMPT", "打招呼语", "招呼语提示词", "multiline",
+     DEFAULT_GREETING_PROMPT,
+     "自定义表达方式、语气和长度；简历、已确认画像与岗位信息会自动附在提示词后。事实仍受系统约束。"),
 
     ("DELIVER_KEYWORD",  "筛选与简历", "搜索关键词", "text", "", ""),
     ("CITY_CODE",        "筛选与简历", "在哪个城市找", "select", "101280600", "决定在哪个城市找工作"),
@@ -112,16 +139,16 @@ FIELDS = [
     ("PLATFORM_PART_TIME", "筛选与简历", "平台兼职时段", "select", "不限", "仅平台求职类型选「兼职」时生效"),
     ("PLATFORM_EXPERIENCE", "筛选与简历", "平台经验要求", "select", "不限", "按 BOSS 工作经验筛选"),
     ("PLATFORM_DEGREE", "筛选与简历", "平台学历要求", "select", "不限", "按 BOSS 学历筛选"),
-    ("PLATFORM_INDUSTRY", "筛选与简历", "平台行业 ID", "text", "", "可选；填写 BOSS 行业分类 ID，例如 100020，留空不限"),
+    ("PLATFORM_INDUSTRY", "筛选与简历", "平台行业", "text", "", "可选择行业；也可填逗号分隔的 ID 或粘贴包含 industry 参数的 BOSS 搜索链接"),
     ("PLATFORM_SCALE", "筛选与简历", "平台公司规模", "select", "不限", "按 BOSS 公司规模筛选"),
     ("MATCH_THRESHOLD",  "筛选与简历", "AI匹配阈值", "int", "70", "0-100，低于该分数不投"),
     ("JOB_TYPE_PREFERENCE", "筛选与简历", "优先岗位性质", "select", "实习", "平台不限时用于队列排序；平台选实习/全职时自动同步，选兼职时不适用"),
     ("RESUME_FILE",      "筛选与简历", "简历文件", "text", "resume.md", "markdown 简历路径"),
-    ("DELIVER_MAX_PAGES","筛选与简历", "每轮最多翻几页", "int", "3", "每轮采集的列表页数"),
-    ("AREA_FILTER",      "筛选与简历", "本地区域再筛", "text", "", "按行政区/商圈文本再筛一次；一般用上面的平台区域即可"),
+    ("DELIVER_MAX_PAGES","筛选与简历", "搜索请求基础预算", "int", "10", "目标岗位数不足时仍用于扩大搜索范围；目标数较大时自动扩展补足，单轮最多搜索 50 次"),
+    ("AREA_FILTER",      "筛选与简历", "本地区域再筛", "text", "", "按行政区/商圈名称二次筛选；多个名称用英文逗号分隔，留空表示不限"),
 
     ("REST_DAY_REQUIRE", "工作时间与休息", "休息制度", "select", "不限", "与 JD 明确标注的休息制度不一致时过滤；未知信息放行"),
-    ("WORK_TIME_START",  "工作时间与休息", "最早上班时间", "text", "", "如 09:30，JD 上班晚于该值则过滤，留空不启用"),
+    ("WORK_TIME_START",  "工作时间与休息", "最早可接受上班时间", "text", "", "如 09:00，过滤早于该时间上班的岗位；09:00及以后通过，留空不启用"),
     ("WORK_TIME_END",    "工作时间与休息", "最晚下班时间", "text", "", "如 19:00，JD 下班晚于该值视为加班过滤，留空不启用"),
     ("WELFARE_REQUIRE",  "工作时间与休息", "期望福利", "multiselect", "", "作为 AI 评分的加分参考；不选表示不限"),
 
@@ -130,15 +157,16 @@ FIELDS = [
     ("JOB_DELAY_MAX", "投递节奏", "岗位间隔最大(秒)", "int", "50", ""),
     ("HUMAN_EVERY_N", "投递节奏", "每投N个穿插拟人浏览", "int", "5", "0 = 关闭"),
 
-    ("HUMANIZE_ENABLE","拟人行为", "启用心跳拟人浏览", "bool", "true", "关闭后心跳只保留登录态恢复，跑得更快"),
-    ("FAVORITE_SCORE", "拟人行为", "收藏评分门槛", "int", "75", "心跳收藏只收藏 AI 匹配分高于该值的岗位"),
+    ("HUMANIZE_ENABLE","拟人行为", "启用拟人浏览", "bool", "true", "关闭额外浏览动作，保留登录信息同步"),
     ("DETAIL_DELAY_MIN","拟人行为", "详情页停留最小(秒)", "int", "3", "点开岗位/公司页后的浏览时长"),
     ("DETAIL_DELAY_MAX","拟人行为", "详情页停留最大(秒)", "int", "6", ""),
 
     ("DRY_RUN",    "测试模式", "干跑模式（不真实投递）", "bool", "false", ""),
-    ("TEST_LIMIT", "测试模式", "本轮最多处理岗位数", "int", "0", "0 = 不限"),
+    ("TEST_LIMIT", "匹配与投递", "本轮 AI 评估岗位数", "int", "0", "完成详情和范围筛选后进入 AI 评估尝试的岗位数量；不足时自动继续翻页补足，最多搜索 50 次；0 = 不限（高级设置决定搜索请求上限）"),
     ("LOGIN_WAIT", "测试模式", "登录等待秒数", "int", "0", "0 = 自动检测登录成功后继续；>0 = 最多等N秒"),
     ("KEEP_LOGIN", "测试模式", "保留登录信息", "bool", "true", "固定UA+持久profile，重启免登录；关闭则每次随机UA需重新登录"),
+    ("BROWSER_PATH", "高级设置", "浏览器程序路径", "text", "", "留空自动检测随包 Chromium、Chrome 或 Edge；仅在自动检测失败时填写"),
+    ("BROWSER_BACKGROUND", "高级设置", "浏览器后台运行", "bool", "true", "正常运行不显示窗口；扫码或验证时显示"),
 
     ("TAVILY_ENABLED", "画像搜索", "用 Tavily 补充岗位市场信息", "bool", "true", "仅用于画像访谈追问；不搜索简历，不自动写入候选人技能"),
     ("TAVILY_API_KEY", "画像搜索", "Tavily API Key", "password", "", "仅岗位方向和职位族会发送给 Tavily"),
@@ -175,45 +203,119 @@ FIELD_BY_KEY = {field[0]: field for field in FIELDS}
 SETTINGS_SECTIONS = [
     ("模型接口（必填）", ["AI_BASE_URL", "AI_API_KEY", "AI_MODEL"]),
     ("简历与目标岗位", ["RESUME_FILE", "DELIVER_KEYWORD"]),
+    ("本轮任务", ["DRY_RUN", "TEST_LIMIT", "MATCH_THRESHOLD", "DAILY_LIMIT"]),
     ("在哪儿找工作", [
-        "CITY_CODE", "PLATFORM_AREA_FILTER",
-        "PLATFORM_JOB_TYPE", "PLATFORM_PART_TIME", "PLATFORM_PAY_TYPE",
-        "PLATFORM_EXPERIENCE", "PLATFORM_DEGREE", "PLATFORM_INDUSTRY",
-        "PLATFORM_SCALE", "JOB_TYPE_PREFERENCE",
+        "CITY_CODE", "PLATFORM_AREA_FILTER", "AREA_FILTER",
+        "PLATFORM_JOB_TYPE", "JOB_TYPE_PREFERENCE", "PLATFORM_PART_TIME",
+        "PLATFORM_PAY_TYPE", "PLATFORM_EXPERIENCE", "PLATFORM_DEGREE",
+        "PLATFORM_INDUSTRY", "PLATFORM_SCALE",
     ]),
     ("作息与福利", [
         "REST_DAY_REQUIRE", "WORK_TIME_START", "WORK_TIME_END", "WELFARE_REQUIRE",
     ]),
-    ("匹配与投递", ["MATCH_THRESHOLD", "DAILY_LIMIT", "DRY_RUN", "TEST_LIMIT"]),
-    ("画像搜索", ["TAVILY_ENABLED", "TAVILY_API_KEY"]),
+    ("打招呼语", ["GREETING_PROMPT"]),
+    ("可选画像搜索", ["TAVILY_ENABLED", "TAVILY_API_KEY"]),
 ]
 ADVANCED_SECTIONS = [
     ("模型细节", ["AI_REASONING_EFFORT", "AI_TIMEOUT", "AI_MAX_RETRIES", "TAVILY_TIMEOUT"]),
-    ("采集细节", ["DELIVER_MAX_PAGES", "AREA_FILTER"]),
+    ("采集细节", ["DELIVER_MAX_PAGES"]),
     ("投递节奏", ["JOB_DELAY_MIN", "JOB_DELAY_MAX", "HUMAN_EVERY_N"]),
-    ("拟人行为（防风控）", [
-        "HUMANIZE_ENABLE", "FAVORITE_SCORE", "DETAIL_DELAY_MIN", "DETAIL_DELAY_MAX",
+    ("浏览行为", [
+        "HUMANIZE_ENABLE", "DETAIL_DELAY_MIN", "DETAIL_DELAY_MAX",
     ]),
     ("登录与调试", ["LOGIN_WAIT", "KEEP_LOGIN"]),
+    ("浏览器", ["BROWSER_PATH", "BROWSER_BACKGROUND"]),
 ]
 
+WORKFLOW_PAGES = (
+    "求职设置", "画像查看", "增强画像", "投递结果", "运行日志",
+)
+
 PAGE_SUBTITLES = {
-    "求职设置": "简历、目标岗位、城市区域、工作性质、作息与福利——只填这几项就能开始投递。",
-    "画像查看": "分别查看简历解析得到的基础画像和经你确认的增强画像。",
-    "增强画像": "可选：通过访谈补充简历没写到的技能与经历，提升 AI 匹配准确度。",
-    "运行与结果": "查看任务实时进度、日志与投递结果明细。",
-    "高级设置": "技术参数：超时重试、投递间隔、拟人行为与登录调试。一般不用修改。",
+    "求职设置": "填好模型接口、简历与目标岗位即可开始；其余筛选项有合理默认值。",
+    "画像查看": "对照查看简历解析出的基础画像与经你确认的增强画像。",
+    "增强画像": "可选：通过访谈补齐简历没写到的技能与经历，让 AI 匹配更准。",
+    "投递结果": "先看投递状态与匹配分，选中岗位可展开完整评估与证据。",
+    "运行日志": "查看任务实时进度、当前岗位与完整输出日志。",
+    "高级设置": "技术参数：超时重试、投递节奏、拟人行为与登录调试，平时不用改。",
 }
 DEFAULT_SUBTITLE = "调整求职筛选与自动化任务的运行参数。"
+
+# 分组说明：每个设置分区卡片顶部的一句话解释
+SECTION_HINTS = {
+    "模型接口（必填）": "AI 评分与打招呼语都走这个接口，填错了所有任务都会失败。",
+    "简历与目标岗位": "简历决定画像与证据，目标岗位决定搜索关键词。",
+    "本轮任务": "控制这一轮评估多少岗位、投递多少条、是否只做干跑。",
+    "在哪儿找工作": "城市、区域与平台侧筛选条件，共同决定抓到哪些岗位。",
+    "作息与福利": "与 JD 明确冲突时直接过滤；福利只作为评分加分参考。",
+    "打招呼语": "自定义表达方式、语气与长度，简历与画像会自动附在提示词后。",
+    "可选画像搜索": "仅用于访谈追问，不会写入技能，也不会搜索你的简历。",
+    "模型细节": "思考强度、超时与重试次数，直接影响速度与费用。",
+    "采集细节": "搜索请求预算，目标岗位不足时自动扩大搜索范围。",
+    "投递节奏": "岗位之间的等待间隔与穿插浏览频率。",
+    "浏览行为": "停留时长与收藏门槛，用于降低被风控识别的概率。",
+    "登录与调试": "登录等待与登录态保留方式。",
+    "浏览器": "留空自动检测随包 Chromium、Chrome 或 Edge。",
+}
 
 # 侧边栏导航图标（assets 目录下的 SVG 线性图标）
 NAV_ICONS = {
     "求职设置": "nav-settings.svg",
     "画像查看": "nav-user.svg",
     "增强画像": "nav-chat.svg",
-    "运行与结果": "nav-chart.svg",
-    "高级设置": "nav-tools.svg",
+    "投递结果": "nav-chart.svg",
+    "运行日志": "nav-tools.svg",
+    "高级设置": "nav-gear.svg",
 }
+
+# 启动前检查项：(显示名, 取值键)
+SETUP_CHECKS = (
+    ("AI 接口", "AI_API_KEY"),
+    ("目标岗位", "DELIVER_KEYWORD"),
+    ("简历文件", "RESUME_FILE"),
+    ("工作城市", "CITY_CODE"),
+)
+
+SETUP_CHECK_LABELS = {key: label for label, key in SETUP_CHECKS}
+
+# 独占整行的字段：多行文本、多选胶囊与带按钮的长输入
+WIDE_FIELD_KEYS = {
+    "GREETING_PROMPT",
+    "PLATFORM_AREA_FILTER",
+    "WELFARE_REQUIRE",
+    "RESUME_FILE",
+    "AI_BASE_URL",
+    "PLATFORM_INDUSTRY",
+    "AREA_FILTER",
+}
+
+
+def is_wide_field(key: str) -> bool:
+    """该字段是否需要独占整行。"""
+    return key in WIDE_FIELD_KEYS
+
+
+# 输入控件的最大宽度：避免在宽屏下被拉成上千像素的空盒子，文字贴左显得孤立。
+# 独占整行的字段有更宽的空间，给出更大的上限；窄字段保持紧凑。
+FIELD_WIDTH = {
+    "text": 420,
+    "password": 420,
+    "select": 300,
+    "int": 170,
+}
+WIDE_FIELD_WIDTH = {
+    "text": 620,
+    "password": 620,
+    "select": 360,
+}
+
+
+def key_label(key: str) -> str:
+    """取字段的中文显示名。"""
+    field = FIELD_BY_KEY.get(key)
+    if field:
+        return field[2]
+    return SETUP_CHECK_LABELS.get(key, key)
 
 
 def read_env_dict() -> dict:
@@ -224,11 +326,15 @@ def read_env_dict() -> dict:
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
                 values[k.strip()] = v.strip()
+        parsed = dotenv_values(ENV_FILE, interpolate=False)
+        if "GREETING_PROMPT" in parsed:
+            values["GREETING_PROMPT"] = parsed["GREETING_PROMPT"] or ""
     return values
 
 
 def write_env_file(values: dict):
     """按 FIELDS 分组重写 .env。"""
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     if ENV_FILE.exists():
         values = {**read_env_dict(), **values}
     field_keys = {field[0] for field in FIELDS}
@@ -245,6 +351,8 @@ def write_env_file(values: dict):
             val = str(values.get(key, default))
             if ftype == "bool":
                 val = val.strip().lower() if val.strip().lower() in ("true", "false") else default
+            elif ftype == "multiline":
+                val = "'" + val.replace("\\", "\\\\").replace("'", "\\'") + "'"
             lines.append(f"{key}={val}")
     unknown = [(key, value) for key, value in values.items() if key not in field_keys]
     if unknown:
@@ -290,6 +398,7 @@ def current_deliver_config() -> dict:
         "AI_REASONING_EFFORT": "ai_reasoning_effort",
         "AI_TIMEOUT": "ai_timeout",
         "AI_MAX_RETRIES": "ai_max_retries",
+        "GREETING_PROMPT": "greeting_prompt",
         "TAVILY_ENABLED": "tavily_enabled",
         "TAVILY_API_KEY": "tavily_api_key",
         "TAVILY_TIMEOUT": "tavily_timeout",
@@ -297,7 +406,9 @@ def current_deliver_config() -> dict:
     for env_key, cfg_key in mapping.items():
         if env_key not in values:
             continue
-        raw = str(values[env_key] or "").strip()
+        raw = str(values[env_key] or "")
+        if cfg_key != "greeting_prompt":
+            raw = raw.strip()
         if cfg_key in {"ai_timeout", "ai_max_retries", "tavily_timeout"}:
             try:
                 merged[cfg_key] = int(raw) if raw else DELIVER_CONFIG[cfg_key]
@@ -331,11 +442,14 @@ class PanelApp(
     def __init__(self):
         super().__init__()
         self.setWindowTitle("求职工作台")
+        self.setWindowIcon(QIcon(str(ASSETS_DIR / "app.ico")))
         self.resize(1420, 900)
         self.setMinimumSize(1180, 760)
 
         self.runner = TaskRunner()
         self.vars = {}                 # key -> (控件, 类型, 默认值)
+        self.field_blocks = {}         # key -> 该配置项的字段块（用于定位跳转）
+        self.field_pages = {}          # key -> 所在页面名
         self.multiselect_checks = {}   # key -> [(选项, QCheckBox)]
         self.platform_area_choices = []
         self._last_platform_job_type = "不限"
@@ -344,6 +458,11 @@ class PanelApp(
         self.location_events = queue.Queue()
         self.location_generation = 0
         self.location_city_code = ""
+        self.industry_events = queue.Queue()
+        self.industry_generation = 0
+        self.platform_industry_groups = []
+        self.platform_industry_choices = {}
+        self.platform_industry_names = {}
         self._loading_env = False
         self.status_text = "空闲"
         self.profile_events = queue.Queue()
@@ -406,50 +525,76 @@ class PanelApp(
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
-        root_layout.addWidget(self._build_header())
 
         body = QWidget()
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
         body_layout.addWidget(self._build_sidebar())
-        body_layout.addWidget(self._build_content(), 1)
+        body_layout.addWidget(self._build_workspace(), 1)
         root_layout.addWidget(body, 1)
 
         self._show_page("求职设置")
 
-    def _build_header(self) -> QFrame:
-        header = QFrame()
-        header.setObjectName("header")
-        header.setFixedHeight(76)
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(24, 0, 24, 0)
-        layout.setSpacing(14)
+    def _build_workspace(self) -> QWidget:
+        """右侧工作区：顶部标题条 + 页面内容。"""
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
+        workspace_layout.addWidget(self._build_topbar())
 
-        mark = QLabel("职")
-        mark.setObjectName("brandMark")
-        mark.setFixedSize(38, 38)
-        mark.setAlignment(Qt.AlignCenter)
-        layout.addWidget(mark)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(28, 20, 28, 26)
+        content_layout.setSpacing(0)
+
+        self.page_stack = QStackedWidget()
+        self.pages = {}
+        settings = ["高级设置"]
+
+        builders = {
+            "求职设置": lambda: self._build_settings_page(SETTINGS_SECTIONS, True, "求职设置"),
+            "画像查看": self._build_profile_view_page,
+            "增强画像": self._build_candidate_profile_page,
+            "高级设置": lambda: self._build_settings_page(ADVANCED_SECTIONS, False, "高级设置"),
+            "投递结果": self._build_result_page,
+            "运行日志": self._build_log_page,
+        }
+        for name in (*WORKFLOW_PAGES, *settings):
+            page = builders[name]()
+            self.pages[name] = page
+            self.page_stack.addWidget(page)
+
+        content_layout.addWidget(self.page_stack, 1)
+        workspace_layout.addWidget(content, 1)
+        self.config_notice = ToastNotice(workspace)
+        return workspace
+
+    def _build_topbar(self) -> QFrame:
+        """顶部标题条：左侧当前页标题，右侧全局状态与主操作。"""
+        topbar = QFrame()
+        topbar.setObjectName("header")
+        topbar.setFixedHeight(76)
+        layout = QHBoxLayout(topbar)
+        layout.setContentsMargins(28, 0, 24, 0)
+        layout.setSpacing(14)
 
         titles = QVBoxLayout()
         titles.setContentsMargins(0, 0, 0, 0)
         titles.setSpacing(3)
-        brand = QLabel("求职工作台")
-        brand.setObjectName("brand")
-        subtitle = QLabel("岗位筛选与简历匹配")
-        subtitle.setObjectName("brandSub")
-        titles.addWidget(brand)
-        titles.addWidget(subtitle)
+        self.page_title = QLabel()
+        self.page_title.setObjectName("pageTitle")
+        self.page_subtitle = QLabel()
+        self.page_subtitle.setObjectName("pageSubtitle")
+        titles.addWidget(self.page_title)
+        titles.addWidget(self.page_subtitle)
         layout.addLayout(titles)
-
         layout.addStretch(1)
-        layout.addWidget(self._build_status_cluster())
-        layout.addSpacing(6)
-        layout.addWidget(self._vdivider())
-        layout.addSpacing(6)
 
-        self.btn_refresh = QPushButton("刷新结果")
+        layout.addWidget(self._build_status_chip())
+
+        self.btn_refresh = QPushButton("刷新")
         self.btn_refresh.setObjectName("ghost")
         self.btn_refresh.setIcon(QIcon(str(ASSETS_DIR / "refresh.svg")))
         self.btn_refresh.setIconSize(QSize(15, 15))
@@ -459,6 +604,9 @@ class PanelApp(
         layout.addWidget(self.btn_refresh)
 
         self.btn_save = QPushButton("保存配置")
+        self.btn_save.setObjectName("soft")
+        self.btn_save.setIcon(QIcon(str(ASSETS_DIR / "save.svg")))
+        self.btn_save.setIconSize(QSize(15, 15))
         self.btn_save.setToolTip("把当前面板配置写入 .env")
         self.btn_save.setCursor(Qt.PointingHandCursor)
         self.btn_save.clicked.connect(self.save_config)
@@ -480,70 +628,107 @@ class PanelApp(
         self.btn_start.setCursor(Qt.PointingHandCursor)
         self.btn_start.clicked.connect(self.start_task)
         layout.addWidget(self.btn_start)
-        return header
+        return topbar
 
-    def _build_status_cluster(self) -> QWidget:
-        """状态区：状态点 + 状态文案 + 今日投递配额进度，避免裸文字标签。"""
-        holder = QWidget()
+    def _build_status_chip(self) -> QFrame:
+        """运行状态胶囊：状态点 + 状态文案（固定高度，不随顶栏拉伸）。"""
+        holder = QFrame()
         holder.setObjectName("statusCluster")
+        holder.setFixedHeight(34)
+        holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         row = QHBoxLayout(holder)
-        row.setContentsMargins(16, 0, 16, 0)
-        row.setSpacing(10)
+        row.setContentsMargins(13, 0, 15, 0)
+        row.setSpacing(9)
 
-        self.status_dot = QLabel()
-        self.status_dot.setObjectName("statusDotIdle")
-        self.status_dot.setFixedSize(10, 10)
-        row.addWidget(self.status_dot)
+        self.status_dot = StatusDot()
+        row.addWidget(self.status_dot, 0, Qt.AlignVCenter)
 
         self.status_label = QLabel(self.status_text)
         self.status_label.setObjectName("statusText")
-        row.addWidget(self.status_label)
+        row.addWidget(self.status_label, 0, Qt.AlignVCenter)
+        return holder
 
-        row.addWidget(self._vdivider())
+    def _build_sidebar(self) -> QFrame:
+        """左侧导航栏：品牌区 + 分组导航 + 底部今日配额。"""
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(228)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 22, 14, 16)
+        layout.setSpacing(4)
 
-        row.addWidget(self._label("今日投递", "hint"))
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(4, 0, 4, 0)
+        brand_row.setSpacing(11)
+        mark = QLabel("职")
+        mark.setObjectName("sidebarLogo")
+        mark.setFixedSize(36, 36)
+        mark.setAlignment(Qt.AlignCenter)
+        brand_row.addWidget(mark)
+        brand_texts = QVBoxLayout()
+        brand_texts.setContentsMargins(0, 0, 0, 0)
+        brand_texts.setSpacing(2)
+        brand = QLabel("求职工作台")
+        brand.setObjectName("sidebarBrand")
+        brand_texts.addWidget(brand)
+        tagline = QLabel("岗位筛选与简历匹配")
+        tagline.setObjectName("sidebarTag")
+        brand_texts.addWidget(tagline)
+        brand_row.addLayout(brand_texts)
+        brand_row.addStretch(1)
+        layout.addLayout(brand_row)
+        layout.addSpacing(18)
+
+        self.nav_buttons = {}
+        self._add_nav_section(
+            sidebar, layout, "求职流程",
+            ["求职设置", "增强画像", "投递结果", "运行日志"],
+        )
+        self._add_nav_section(
+            sidebar, layout, "查看与配置", ["画像查看", "高级设置"],
+        )
+        layout.addStretch(1)
+        layout.addWidget(self._build_sidebar_footer())
+        self.btn_about = QPushButton("关于", sidebar)
+        self.btn_about.setObjectName("nav")
+        self.btn_about.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        self.btn_about.setIconSize(QSize(16, 16))
+        self.btn_about.setCursor(Qt.PointingHandCursor)
+        self.btn_about.setToolTip("作者信息与免责声明")
+        self.btn_about.clicked.connect(self._open_about)
+        layout.addWidget(self.btn_about)
+        return sidebar
+
+    def _open_about(self):
+        AboutDialog(self).exec()
+
+    def _build_sidebar_footer(self) -> QFrame:
+        """侧边栏底部：今日投递配额与进度。"""
+        card = QFrame()
+        card.setObjectName("sideFooter")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 13)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        caption = QLabel("今日投递")
+        caption.setObjectName("sideCaption")
+        row.addWidget(caption)
+        row.addStretch(1)
         self.status_quota = QLabel("0 / 0")
-        self.status_quota.setObjectName("statusQuota")
+        self.status_quota.setObjectName("sideMetric")
         row.addWidget(self.status_quota)
+        layout.addLayout(row)
 
         self.status_bar = QProgressBar()
         self.status_bar.setObjectName("quotaBar")
         self.status_bar.setRange(0, 50)
         self.status_bar.setValue(0)
         self.status_bar.setTextVisible(False)
-        self.status_bar.setFixedSize(104, 6)
-        row.addWidget(self.status_bar)
-        return holder
-
-    @staticmethod
-    def _vdivider():
-        line = QFrame()
-        line.setObjectName("vDivider")
-        line.setFixedWidth(1)
-        line.setFixedHeight(20)
-        return line
-
-    def _build_sidebar(self) -> QFrame:
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(236)
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 20, 12, 18)
-        layout.setSpacing(2)
-
-        title = QLabel("工作区")
-        title.setObjectName("sidebarTitle")
-        layout.addWidget(title)
-        layout.addSpacing(6)
-
-        workflow = ["求职设置", "画像查看", "增强画像", "运行与结果"]
-        settings = ["高级设置"]
-
-        self.nav_buttons = {}
-        self._add_nav_section(sidebar, layout, "求职流程", workflow)
-        self._add_nav_section(sidebar, layout, "参数设置", settings)
-        layout.addStretch(1)
-        return sidebar
+        self.status_bar.setFixedHeight(6)
+        layout.addWidget(self.status_bar)
+        return card
 
     def _add_nav_section(self, sidebar, layout, title, names):
         label = QLabel(title)
@@ -564,40 +749,6 @@ class PanelApp(
             layout.addWidget(button)
             self.nav_buttons[name] = button
 
-    def _build_content(self) -> QWidget:
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(26, 22, 26, 22)
-        layout.setSpacing(0)
-
-        self.page_title = QLabel()
-        self.page_title.setObjectName("pageTitle")
-        self.page_subtitle = QLabel()
-        self.page_subtitle.setObjectName("pageSubtitle")
-        layout.addWidget(self.page_title)
-        layout.addWidget(self.page_subtitle)
-        layout.addSpacing(16)
-
-        self.page_stack = QStackedWidget()
-        self.pages = {}
-        workflow = ["求职设置", "画像查看", "增强画像", "运行与结果"]
-        settings = ["高级设置"]
-
-        builders = {
-            "求职设置": lambda: self._build_settings_page(SETTINGS_SECTIONS),
-            "画像查看": self._build_profile_view_page,
-            "增强画像": self._build_candidate_profile_page,
-            "高级设置": lambda: self._build_settings_page(ADVANCED_SECTIONS),
-            "运行与结果": self._build_run_page,
-        }
-        for name in workflow + settings:
-            page = builders[name]()
-            self.pages[name] = page
-            self.page_stack.addWidget(page)
-
-        layout.addWidget(self.page_stack, 1)
-        return content
-
     def _show_page(self, name):
         if name not in self.pages:
             return
@@ -611,6 +762,11 @@ class PanelApp(
             self._maybe_prewarm_draft()
         elif name == "画像查看":
             self._refresh_candidate_profile_view()
+        elif name == "投递结果":
+            try:
+                self.refresh_results()
+            except Exception as exc:
+                print(f"[面板] 刷新结果失败: {exc}")
 
     # ---------------- 通用小部件 --------------
     @staticmethod
@@ -625,16 +781,15 @@ class PanelApp(
                 PanelApp._clear_layout(item.layout())
 
     # ---------------- 设置页 ----------------
-    def _build_settings_page(self, sections):
+    def _build_settings_page(self, sections, show_checklist=False, page_name=""):
         page = QWidget()
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.setSpacing(10)
+        page_layout.setSpacing(0)
 
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(2, 0, 2, 0)
-        toolbar.addWidget(self._label(
-            "修改后点右上角「保存配置」写入 .env 并立即生效", "hint"))
+        toolbar.addWidget(self._label("启动任务时会自动保存当前设置", "hint"))
         toolbar.addStretch(1)
         env_toggle = QPushButton("查看原始 .env")
         env_toggle.setCheckable(True)
@@ -643,6 +798,17 @@ class PanelApp(
         env_toggle.clicked.connect(self._toggle_env_preview)
         toolbar.addWidget(env_toggle)
         page_layout.addLayout(toolbar)
+        page_layout.addSpacing(12)
+
+        env_preview = QPlainTextEdit()
+        env_preview.setObjectName("envPreview")
+        env_preview.setReadOnly(True)
+        env_preview.setVisible(False)
+        env_preview.setFixedHeight(190)
+        env_preview.setPlaceholderText("（.env 文件为空）")
+        self.env_previews.append((env_toggle, env_preview))
+        page_layout.addWidget(env_preview)
+        page_layout.addSpacing(12)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -650,34 +816,89 @@ class PanelApp(
 
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(0, 0, 6, 6)
-        inner_layout.setSpacing(14)
+        inner_layout.setContentsMargins(0, 0, 8, 8)
+        inner_layout.setSpacing(16)
 
-        env_preview = QPlainTextEdit()
-        env_preview.setObjectName("envPreview")
-        env_preview.setReadOnly(True)
-        env_preview.setVisible(False)
-        env_preview.setFixedHeight(180)
-        env_preview.setPlaceholderText("（.env 文件为空）")
-        self.env_previews.append((env_toggle, env_preview))
+        if show_checklist:
+            inner_layout.addWidget(self._build_setup_checklist())
 
         for title, keys in sections:
-            inner_layout.addWidget(self._build_config_section(title, keys))
-        inner_layout.addWidget(env_preview)
+            inner_layout.addWidget(self._build_config_section(title, keys, page_name))
+
         inner_layout.addStretch(1)
         scroll.setWidget(inner)
         page_layout.addWidget(scroll, 1)
         return page
 
-    def _build_config_section(self, title, keys):
-        card, card_layout = self._card((22, 16, 22, 18), 0)
+    def _build_setup_checklist(self):
+        """启动前检查：把「还差什么」直接摆出来，点击可跳到对应输入框。"""
+        card = SectionCard(
+            "启动前检查", "这四项填好就能直接启动投递任务，其余筛选项都有默认值。"
+        )
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        self.setup_check_labels = {}
+        for name, key in SETUP_CHECKS:
+            chip = ClickableLabel(f"○ {name}")
+            chip.setObjectName("checkTodo")
+            chip.setToolTip(f"点击定位到「{name}」的设置项")
+            chip.clicked.connect(lambda _=False, k=key: self._focus_field(k))
+            row.addWidget(chip)
+            self.setup_check_labels[key] = chip
+        row.addStretch(1)
+        card.body.addLayout(row)
+        return card
 
-        head = QWidget()
-        head_layout = QHBoxLayout(head)
-        head_layout.setContentsMargins(0, 0, 0, 0)
-        head_layout.setSpacing(8)
-        head_layout.addWidget(self._label(title, "section"))
-        head_layout.addStretch(1)
+    def _focus_field(self, key):
+        """跳到指定配置项并聚焦它的输入框。"""
+        block = self.field_blocks.get(key)
+        if block is None:
+            return
+        page_name = self.field_pages.get(key)
+        if page_name:
+            self._show_page(page_name)
+        widget = self.vars.get(key, (None, "", ""))[0]
+        scroll = self._find_scroll_area(block)
+        if scroll is not None:
+            scroll.ensureWidgetVisible(block, 0, 40)
+        if widget is not None and hasattr(widget, "setFocus"):
+            widget.setFocus()
+        self.statusBar().showMessage(f"已定位到「{key_label(key)}」", 2500)
+
+    @staticmethod
+    def _find_scroll_area(widget):
+        """向上找到包裹该控件的 QScrollArea（找不到则返回 None）。"""
+        parent = widget.parent()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                return parent
+            parent = parent.parent()
+        return None
+
+    def _refresh_setup_checks(self, *_args):
+        """更新启动前检查条：逐项标记是否已就绪。"""
+        labels = getattr(self, "setup_check_labels", None)
+        if not labels:
+            return
+        for (name, key), chip in zip(SETUP_CHECKS, labels.values()):
+            widget = self.vars.get(key, (None, "", ""))[0]
+            if widget is None:
+                continue
+            if key == "CITY_CODE":
+                value = widget.currentText().strip()
+            else:
+                value = widget.text().strip() if hasattr(widget, "text") else ""
+            ready = bool(value)
+            if ready and key == "RESUME_FILE":
+                ready = self._resume_file_exists(value)
+            chip.setText(f"✓ {name}" if ready else f"○ {name}")
+            self._set_widget_style(chip, "checkOk" if ready else "checkTodo")
+
+    def _build_config_section(self, title, keys, page_name=""):
+        """一个设置分区：卡片头 + 自适应两列表单。"""
+        card = SectionCard(title, SECTION_HINTS.get(title, ""))
+
         reset_button = QPushButton("恢复默认值")
         reset_button.setObjectName("ghost")
         reset_button.setCursor(Qt.PointingHandCursor)
@@ -685,71 +906,46 @@ class PanelApp(
         reset_button.clicked.connect(
             lambda _checked=False, k=list(keys), t=title: self._reset_section_defaults(k, t)
         )
-        head_layout.addWidget(reset_button)
-        card_layout.addWidget(head)
-        card_layout.addWidget(self._divider())
+        card.header_actions.addWidget(reset_button)
 
-        rows = QVBoxLayout()
-        rows.setContentsMargins(0, 0, 0, 0)
-        rows.setSpacing(0)
-        for index, key in enumerate(keys):
-            if index:
-                rows.addWidget(self._divider())
-            rows.addWidget(self._build_field_row(key))
-        card_layout.addLayout(rows)
+        grid = FormGrid()
+        for key in keys:
+            # 开关行与输入框结构不同，混排会错位，单独占整行更整齐。
+            block = self._build_field_block(key)
+            self.field_blocks[key] = block
+            if page_name:
+                self.field_pages[key] = page_name
+            grid.add(
+                block,
+                full_width=is_wide_field(key) or FIELD_BY_KEY[key][3] == "bool",
+            )
+        card.body.addWidget(grid)
         return card
 
-    def _build_field_row(self, key):
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(26)
-        row_layout.addWidget(self._build_field_label(key))
-        row_layout.addWidget(self._build_field_control(key), 1)
-        return row
-
-    def _build_field_label(self, key):
-        """左列：字段名 + 说明文字（说明不再占用右侧空白列）。"""
-        _, _group, label, ftype, _default, note = FIELD_BY_KEY[key]
-        holder = QWidget()
-        holder.setMinimumWidth(216)
-        holder.setMaximumWidth(268)
-        layout = QVBoxLayout(holder)
-        layout.setContentsMargins(0, 13, 0, 13)
-        layout.setSpacing(4)
-        if ftype != "bool":
-            title = QLabel(label)
-            title.setObjectName("fieldLabel")
-            title.setWordWrap(True)
-            layout.addWidget(title)
-        if note:
-            note_label = QLabel(note)
-            note_label.setObjectName("fieldNote")
-            note_label.setWordWrap(True)
-            layout.addWidget(note_label)
-        layout.addStretch(1)
-        return holder
-
-    def _build_field_control(self, key):
-        """右列：输入控件（多选为可勾选胶囊，其余为输入框 / 下拉 / 数字）。"""
-        _, _group, label, ftype, default, _note = FIELD_BY_KEY[key]
+    def _build_field_block(self, key):
+        """单个配置项：布尔用开关行，其余用「标题 + 控件 + 说明」。"""
+        _, _group, label, ftype, default, note = FIELD_BY_KEY[key]
 
         if ftype == "bool":
-            widget = QCheckBox(label)
-            widget.setCursor(Qt.PointingHandCursor)
-            holder = QWidget()
-            holder_layout = QVBoxLayout(holder)
-            holder_layout.setContentsMargins(0, 12, 0, 12)
-            holder_layout.setSpacing(4)
-            holder_layout.addWidget(widget)
+            row = ToggleRow(label, note)
+            self.vars[key] = (row, ftype, default)
             if key in CONFIG_WARNINGS:
                 hint = self._label("", "warnText", wrap=True)
                 self.field_hints[key] = hint
-                holder_layout.addWidget(hint)
-                widget.toggled.connect(self._refresh_field_hints)
-            holder_layout.addStretch(1)
-            self.vars[key] = (widget, ftype, default)
-            return holder
+                row.add_message(hint)
+                row.toggled.connect(self._refresh_field_hints)
+            row.toggled.connect(self._refresh_setup_checks)
+            return row
+
+        control = self._build_field_control(key)
+        block = FieldBlock(label, control, note)
+        return block
+
+    def _build_field_control(self, key):
+        """构造输入控件，返回可直接放进 FieldBlock 的控件。"""
+        _, _group, label, ftype, default, _note = FIELD_BY_KEY[key]
+        # 独占整行的字段有更宽的空间，用更宽松的上限
+        limits = WIDE_FIELD_WIDTH if is_wide_field(key) else FIELD_WIDTH
 
         if ftype == "multiselect":
             host = QWidget()
@@ -764,29 +960,35 @@ class PanelApp(
                 checks.append((option, check))
             if key == "PLATFORM_AREA_FILTER":
                 self.platform_area_flow = flow
-                self.platform_area_status = self._label("正在读取所选城市的区域…", "muted", wrap=True)
-                self.platform_area_refresh = QPushButton("刷新区域")
-                self.platform_area_refresh.setToolTip("重新读取当前城市在 BOSS 上可筛选的区域")
-                self.platform_area_refresh.clicked.connect(self._refresh_platform_areas)
-                flow.addWidget(self.platform_area_status)
                 self.platform_area_choices = checks
                 self.multiselect_checks[key] = checks
-                flow.addWidget(self.platform_area_refresh)
-            else:
-                self.multiselect_checks[key] = checks
+                self.platform_area_status = self._label("正在读取所选城市的区域…", "muted", wrap=True)
+                self.platform_area_refresh = QPushButton("刷新区域")
+                self.platform_area_refresh.setObjectName("soft")
+                self.platform_area_refresh.setToolTip("重新读取当前城市在 BOSS 上可筛选的区域")
+                self.platform_area_refresh.clicked.connect(self._refresh_platform_areas)
+                container = QWidget()
+                container_layout = QVBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(8)
+                container_layout.addWidget(host)
+                status_row = QHBoxLayout()
+                status_row.setContentsMargins(0, 0, 0, 0)
+                status_row.setSpacing(8)
+                status_row.addWidget(self.platform_area_status, 1)
+                status_row.addWidget(self.platform_area_refresh)
+                container_layout.addLayout(status_row)
+                self.vars[key] = (host, ftype, default)
+                return container
+            self.multiselect_checks[key] = checks
             self.vars[key] = (host, ftype, default)
-            holder = QWidget()
-            holder_layout = QVBoxLayout(holder)
-            holder_layout.setContentsMargins(0, 12, 0, 12)
-            holder_layout.addWidget(host)
-            holder_layout.addStretch(1)
-            return holder
+            return host
 
         if ftype == "select":
             widget = QComboBox()
             widget.addItems(SELECT_OPTIONS[key])
-            widget.setMaximumWidth(260)
             widget.setCursor(Qt.PointingHandCursor)
+            widget.setMaximumWidth(limits["select"])
             if key == "CITY_CODE":
                 widget.setEditable(True)
                 widget.setInsertPolicy(QComboBox.NoInsert)
@@ -799,7 +1001,12 @@ class PanelApp(
             widget = QLineEdit()
             widget.setEchoMode(QLineEdit.Password)
             widget.setPlaceholderText(default or "未填写")
-            widget.setMaximumWidth(420)
+            widget.setMaximumWidth(limits["password"])
+        elif ftype == "multiline":
+            widget = QPlainTextEdit()
+            widget.setMinimumHeight(170)
+            widget.setMaximumHeight(240)
+            widget.setTabChangesFocus(False)
         elif ftype == "int":
             low, high = INT_LIMITS.get(key, (0, 999999))
             widget = QSpinBox()
@@ -809,63 +1016,100 @@ class PanelApp(
             except ValueError:
                 widget.setValue(low)
             widget.setAccelerated(True)
-            widget.setMaximumWidth(160)
+            widget.setMaximumWidth(FIELD_WIDTH["int"])
+            pad_spinbox_text(widget)
         else:
             widget = QLineEdit()
-            widget.setMaximumWidth(420)
+            widget.setMaximumWidth(limits["text"])
+
+        if ftype == "multiline":
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(8)
+            container_layout.addWidget(widget)
+            actions = QHBoxLayout()
+            actions.setContentsMargins(0, 0, 0, 0)
+            actions.setSpacing(4)
+
+            reset_prompt = QPushButton("恢复默认提示词")
+            reset_prompt.setObjectName("ghost")
+            reset_prompt.setToolTip("只重置提示词编辑框，不会自动保存")
+            reset_prompt.clicked.connect(
+                lambda: widget.setPlainText(DEFAULT_GREETING_PROMPT)
+            )
+            actions.addWidget(reset_prompt)
+
+            test_prompt = QPushButton("测试提示词")
+            test_prompt.setObjectName("ghost")
+            test_prompt.setToolTip("用当前编辑中的提示词生成一条测试招呼语，不会投递")
+            test_prompt.clicked.connect(self._open_greeting_prompt_test)
+            actions.addWidget(test_prompt)
+            actions.addStretch(1)
+            container_layout.addLayout(actions)
+            self.vars[key] = (widget, ftype, default)
+            return container
 
         if key == "RESUME_FILE":
-            holder = QWidget()
-            holder_layout = QVBoxLayout(holder)
-            holder_layout.setContentsMargins(0, 12, 0, 12)
-            holder_layout.setSpacing(6)
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(8)
             input_row = QHBoxLayout()
             input_row.setContentsMargins(0, 0, 0, 0)
             input_row.setSpacing(8)
-            input_row.addWidget(widget)
+            # 简历路径后面跟着两个按钮，输入框留出足够空间而不撑爆整行
+            widget.setMaximumWidth(430)
+            input_row.addWidget(widget, 1)
             browse_button = QPushButton("选择文件")
+            browse_button.setObjectName("soft")
             browse_button.setToolTip("浏览并选择简历文件（markdown 或文本）")
             browse_button.setCursor(Qt.PointingHandCursor)
             browse_button.clicked.connect(self._browse_resume)
             input_row.addWidget(browse_button)
             self.resume_struct_button = QPushButton("结构化简历")
+            self.resume_struct_button.setObjectName("soft")
             self.resume_struct_button.setToolTip(
                 "调用模型把简历提取为结构化摘要（逐字摘录），供画像访谈与岗位评分使用"
             )
             self.resume_struct_button.setCursor(Qt.PointingHandCursor)
             self.resume_struct_button.clicked.connect(self._structure_resume)
             input_row.addWidget(self.resume_struct_button)
-            input_row.addStretch(1)
-            holder_layout.addLayout(input_row)
+            container_layout.addLayout(input_row)
             self.resume_digest_status = self._label("", "muted", wrap=True)
-            holder_layout.addWidget(self.resume_digest_status)
+            container_layout.addWidget(self.resume_digest_status)
             hint = self._label("", "errorText", wrap=True)
             self.field_hints[key] = hint
-            holder_layout.addWidget(hint)
-        elif key in ("WORK_TIME_START", "WORK_TIME_END"):
-            holder = QWidget()
-            holder_layout = QVBoxLayout(holder)
-            holder_layout.setContentsMargins(0, 12, 0, 12)
-            holder_layout.setSpacing(4)
-            holder_layout.addWidget(widget)
-            hint = self._label("", "errorText", wrap=True)
-            self.field_hints[key] = hint
-            holder_layout.addWidget(hint)
-        else:
-            holder = QWidget()
-            holder_layout = QVBoxLayout(holder)
-            holder_layout.setContentsMargins(0, 12, 0, 12)
-            holder_layout.addWidget(widget)
-            holder_layout.addStretch(1)
+            container_layout.addWidget(hint)
+            self.vars[key] = (widget, ftype, default)
+            widget.textChanged.connect(self._refresh_field_hints)
+            widget.textChanged.connect(self._refresh_setup_checks)
+            return container
 
         self.vars[key] = (widget, ftype, default)
+        if key == "PLATFORM_INDUSTRY":
+            return self._build_industry_picker(widget)
         if key == "PLATFORM_JOB_TYPE":
             widget.currentTextChanged.connect(self._on_platform_job_type_changed)
         elif key == "JOB_TYPE_PREFERENCE":
             widget.currentTextChanged.connect(self._on_job_type_preference_changed)
-        if key in ("RESUME_FILE", "WORK_TIME_START", "WORK_TIME_END"):
-            widget.textChanged.connect(self._refresh_field_hints)
-        return holder
+        if key in ("AI_API_KEY", "DELIVER_KEYWORD"):
+            widget.textChanged.connect(self._refresh_setup_checks)
+        if key == "CITY_CODE":
+            widget.currentTextChanged.connect(self._refresh_setup_checks)
+        if key not in ("WORK_TIME_START", "WORK_TIME_END"):
+            return widget
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(4)
+        container_layout.addWidget(widget)
+        hint = self._label("", "errorText", wrap=True)
+        self.field_hints[key] = hint
+        container_layout.addWidget(hint)
+        widget.textChanged.connect(self._refresh_field_hints)
+        return container
 
     def _toggle_env_preview(self, checked=False):
         button = self.sender()
@@ -908,9 +1152,12 @@ class PanelApp(
                     widget.setValue(int(default))
                 except ValueError:
                     pass
+            elif ftype == "multiline":
+                widget.setPlainText(str(default))
             else:
                 widget.setText(str(default))
         self._refresh_field_hints()
+        self._refresh_setup_checks()
         QMessageBox.information(
             self, "恢复默认值",
             f"「{title}」已恢复为内置默认值，点击「保存配置」后写入 .env 生效。",
@@ -981,6 +1228,8 @@ class PanelApp(
                     widget.setValue(int(val or default))
                 except ValueError:
                     widget.setValue(int(default))
+            elif ftype == "multiline":
+                widget.setPlainText(val)
             else:
                 widget.setText(val)
         self._loading_env = False
@@ -1005,6 +1254,7 @@ class PanelApp(
         self._update_part_time_filter_control(platform_type)
         self._refresh_digest_status()
         self._refresh_field_hints()
+        self._refresh_setup_checks()
         self._refresh_platform_areas()
 
     def _on_platform_job_type_changed(self, platform_type):
@@ -1055,6 +1305,178 @@ class PanelApp(
             )
         else:
             widget.setToolTip("平台不限职位性质时，按所选性质优先处理；其他岗位仍保留在队列。")
+
+    def _build_industry_picker(self, field):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        field.setPlaceholderText("行业 ID，或包含 industry 参数的搜索链接")
+        row.addWidget(field, 1)
+        self.platform_industry_refresh = QPushButton("加载行业")
+        self.platform_industry_refresh.setObjectName("soft")
+        self.platform_industry_refresh.setCursor(Qt.PointingHandCursor)
+        self.platform_industry_refresh.setToolTip("从 BOSS 读取可筛选的行业分类")
+        self.platform_industry_refresh.clicked.connect(self._refresh_platform_industries)
+        row.addWidget(self.platform_industry_refresh)
+        layout.addLayout(row)
+
+        self.platform_industry_category = QComboBox()
+        self.platform_industry_category.addItem("请选择行业分类")
+        self.platform_industry_category.setEnabled(False)
+        self.platform_industry_category.setMaximumWidth(WIDE_FIELD_WIDTH["select"])
+        self.platform_industry_category.currentIndexChanged.connect(self._show_industry_category)
+        layout.addWidget(self.platform_industry_category)
+
+        self.platform_industry_scroll = QScrollArea()
+        self.platform_industry_scroll.setWidgetResizable(True)
+        self.platform_industry_scroll.setFixedHeight(168)
+        self.platform_industry_scroll.setVisible(False)
+        list_host = QWidget()
+        self.platform_industry_list = QVBoxLayout(list_host)
+        self.platform_industry_list.setContentsMargins(8, 6, 8, 6)
+        self.platform_industry_list.setSpacing(6)
+        self.platform_industry_list.setAlignment(Qt.AlignTop)
+        self.platform_industry_scroll.setWidget(list_host)
+        layout.addWidget(self.platform_industry_scroll)
+
+        self.platform_industry_status = self._label(
+            "可加载行业分类，或直接填写行业 ID / 搜索链接。", "muted", wrap=True
+        )
+        self.platform_industry_status.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.platform_industry_status)
+        field.textChanged.connect(self._sync_industry_choices)
+        return container
+
+    def _refresh_platform_industries(self, *_args):
+        self.industry_generation += 1
+        generation = self.industry_generation
+        self.platform_industry_refresh.setEnabled(False)
+        self.platform_industry_status.setText("正在读取行业分类…")
+
+        def fetch():
+            try:
+                payload = (generation, fetch_platform_industries(), "")
+            except Exception as exc:
+                payload = (generation, [], str(exc))
+            self.industry_events.put(payload)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _apply_platform_industries(self, generation, groups, error):
+        if generation != self.industry_generation:
+            return
+        self.platform_industry_refresh.setEnabled(True)
+        self.platform_industry_refresh.setText("刷新行业")
+        self.platform_industry_groups = groups if not error else []
+        self.platform_industry_names = {
+            child["code"]: child["name"]
+            for group in self.platform_industry_groups
+            for child in group["children"]
+        }
+        self.platform_industry_category.blockSignals(True)
+        self.platform_industry_category.clear()
+        self.platform_industry_category.addItem("请选择行业分类")
+        for group in self.platform_industry_groups:
+            self.platform_industry_category.addItem(group["name"], group["code"])
+        self.platform_industry_category.blockSignals(False)
+        self.platform_industry_category.setEnabled(bool(self.platform_industry_groups))
+        if error or not groups:
+            self._clear_industry_choices()
+            self.platform_industry_scroll.setVisible(False)
+            self.platform_industry_status.setText(
+                f"行业加载失败：{error}" if error else "平台未返回行业分类；仍可手填 ID。"
+            )
+            return
+
+        selected = resolve_platform_filter(
+            "PLATFORM_INDUSTRY", self.vars["PLATFORM_INDUSTRY"][0].text()
+        ).split(",")
+        first = next((
+            index for index, group in enumerate(groups, 1)
+            if any(child["code"] in selected for child in group["children"])
+        ), 1)
+        self.platform_industry_category.setCurrentIndex(first)
+        self._update_industry_status()
+
+    def _clear_industry_choices(self):
+        self.platform_industry_choices = {}
+        while self.platform_industry_list.count():
+            item = self.platform_industry_list.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+
+    def _show_industry_category(self, index):
+        self._clear_industry_choices()
+        if index < 1 or index > len(self.platform_industry_groups):
+            self.platform_industry_scroll.setVisible(False)
+            return
+        selected = set(resolve_platform_filter(
+            "PLATFORM_INDUSTRY", self.vars["PLATFORM_INDUSTRY"][0].text()
+        ).split(","))
+        for child in self.platform_industry_groups[index - 1]["children"]:
+            code = child["code"]
+            check = QCheckBox(child["name"])
+            check.setObjectName("chipCheck")
+            check.setCursor(Qt.PointingHandCursor)
+            check.setToolTip(f"{child['name']} ({code})")
+            check.setChecked(code in selected)
+            check.toggled.connect(
+                lambda checked, industry_code=code:
+                self._on_industry_choice_toggled(industry_code, checked)
+            )
+            self.platform_industry_list.addWidget(check)
+            self.platform_industry_choices[code] = check
+        self.platform_industry_scroll.setVisible(True)
+
+    def _sync_industry_choices(self, *_args):
+        text = self.vars["PLATFORM_INDUSTRY"][0].text()
+        selected = set(resolve_platform_filter("PLATFORM_INDUSTRY", text).split(","))
+        for code, check in self.platform_industry_choices.items():
+            check.blockSignals(True)
+            check.setChecked(code in selected)
+            check.blockSignals(False)
+        if self.platform_industry_groups:
+            self._update_industry_status()
+
+    def _on_industry_choice_toggled(self, code, checked):
+        field = self.vars["PLATFORM_INDUSTRY"][0]
+        text = field.text().strip()
+        normalized = resolve_platform_filter("PLATFORM_INDUSTRY", text)
+        if text and not normalized:
+            self._sync_industry_choices()
+            self.platform_industry_status.setText("请先修正行业 ID 或搜索链接，再选择行业。")
+            return
+        selected = [part for part in normalized.split(",") if part]
+        if checked and code not in selected:
+            if len(selected) >= 3:
+                self._sync_industry_choices()
+                self.platform_industry_status.setText("平台最多选择 3 个行业；请先取消一个。")
+                return
+            selected.append(code)
+        elif not checked:
+            selected = [item for item in selected if item != code]
+        field.setText(",".join(selected))
+        self._update_industry_status()
+
+    def _update_industry_status(self):
+        text = self.vars["PLATFORM_INDUSTRY"][0].text().strip()
+        normalized = resolve_platform_filter("PLATFORM_INDUSTRY", text)
+        if text and not normalized:
+            self.platform_industry_status.setText(
+                "已加载行业分类；当前手填值无效，请检查 ID 或搜索链接。"
+            )
+            return
+        selected = [part for part in normalized.split(",") if part]
+        names = "、".join(self.platform_industry_names.get(code, code) for code in selected)
+        self.platform_industry_status.setText(
+            f"已加载 {len(self.platform_industry_groups)} 个分类；"
+            + (f"已选：{names}" if selected else "未选择行业")
+        )
 
     def _current_city_code(self):
         city_name = self.vars["CITY_CODE"][0].currentText().strip()
@@ -1109,8 +1531,6 @@ class PanelApp(
             self._clear_platform_area_options()
             self.platform_area_choices = []
             self.platform_area_status.setText(f"区域加载失败：{error}")
-            self.platform_area_flow.addWidget(self.platform_area_status)
-            self.platform_area_flow.addWidget(self.platform_area_refresh)
             return
 
         selected = set(self.pending_platform_area_values)
@@ -1133,21 +1553,142 @@ class PanelApp(
             if districts else "BOSS 未返回可选行政区。"
         )
         self.platform_area_status.setText(status_text)
-        self.platform_area_flow.addWidget(self.platform_area_status)
-        self.platform_area_flow.addWidget(self.platform_area_refresh)
         self.pending_platform_area_values = []
 
     def _clear_platform_area_options(self):
         while self.platform_area_flow.count():
             item = self.platform_area_flow.takeAt(0)
             widget = item.widget()
-            if widget is not None and widget not in (
-                self.platform_area_status,
-                self.platform_area_refresh,
-            ):
+            if widget is not None:
                 widget.deleteLater()
-            elif widget is not None:
-                widget.setParent(self.vars["PLATFORM_AREA_FILTER"][0])
+
+    def _open_greeting_prompt_test(self):
+        values = self._read_widget_values()
+        api_key = str(values.get("AI_API_KEY", "")).strip()
+        if not api_key:
+            QMessageBox.warning(self, "无法测试招呼语", "请先填写 AI API Key。")
+            return
+
+        resume_path = Path(values.get("RESUME_FILE", "resume.md").strip() or "resume.md")
+        if not resume_path.is_absolute():
+            resume_path = BASE_DIR / resume_path
+        try:
+            resume = resume_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "无法测试招呼语", f"简历读取失败：{exc}")
+            return
+        if not resume.strip():
+            QMessageBox.warning(self, "无法测试招呼语", "简历文件为空。")
+            return
+        try:
+            candidate_profile = CandidateProfileStore().load()
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法测试招呼语", f"候选人画像无效：{exc}")
+            return
+
+        config = current_deliver_config()
+        config.update({
+            "ai_base_url": values.get("AI_BASE_URL", "").strip()
+            or "https://api.deepseek.com/v1",
+            "ai_api_key": api_key,
+            "ai_model": values.get("AI_MODEL", "").strip() or "deepseek-chat",
+            "ai_timeout": int(values.get("AI_TIMEOUT", 90) or 90),
+            "ai_max_retries": int(values.get("AI_MAX_RETRIES", 2) or 0),
+            "greeting_prompt": values.get("GREETING_PROMPT", DEFAULT_GREETING_PROMPT),
+        })
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("测试招呼语提示词")
+        dialog.setMinimumSize(700, 620)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.addWidget(self._label("岗位名称", "fieldLabel"), 0, 0)
+        job_title = QLineEdit("AI 应用开发实习生")
+        form.addWidget(job_title, 0, 1)
+        form.addWidget(self._label("公司名称", "fieldLabel"), 1, 0)
+        company = QLineEdit("示例公司")
+        form.addWidget(company, 1, 1)
+        form.addWidget(self._label("岗位描述", "fieldLabel"), 2, 0, Qt.AlignTop)
+        job_description = QPlainTextEdit()
+        job_description.setMinimumHeight(110)
+        job_description.setPlainText("负责 AI 应用开发、RAG 检索与后端接口维护。")
+        form.addWidget(job_description, 2, 1)
+        layout.addLayout(form)
+
+        layout.addWidget(self._label("生成结果", "fieldLabel"))
+        result = QPlainTextEdit()
+        result.setReadOnly(True)
+        result.setPlaceholderText("测试招呼语会显示在这里")
+        layout.addWidget(result, 1)
+        status = self._label(
+            "使用当前简历、候选人画像和编辑中的提示词；不会保存或投递。",
+            "hint", wrap=True,
+        )
+        layout.addWidget(status)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        generate = QPushButton("生成测试语")
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.reject)
+        actions.addWidget(generate)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+
+        events = queue.Queue()
+        timer = QTimer(dialog)
+
+        def poll_result():
+            try:
+                kind, payload = events.get_nowait()
+            except queue.Empty:
+                return
+            timer.stop()
+            generate.setEnabled(True)
+            if kind == "error":
+                status.setText(f"生成失败：{payload}")
+                result.clear()
+            elif payload:
+                result.setPlainText(payload)
+                status.setText("生成完成。")
+            else:
+                result.clear()
+                status.setText("模型未返回招呼语，请检查接口配置或稍后重试。")
+
+        def generate_greeting():
+            job = {
+                "工作名称": job_title.text().strip(),
+                "公司": company.text().strip(),
+                "技术要求": "",
+                "工作介绍": job_description.toPlainText().strip(),
+            }
+            generate.setEnabled(False)
+            result.clear()
+            status.setText("正在调用模型生成…")
+            timer.start(100)
+
+            def worker():
+                try:
+                    # 延迟导入：ai_client 会连带加载 LangChain，冷启动时不必付出这段耗时
+                    from ai_client import AIClient
+
+                    greeting = AIClient(config).gen_greeting(
+                        resume, job, candidate_profile=candidate_profile
+                    )
+                    events.put(("ok", greeting))
+                except Exception as exc:
+                    events.put(("error", str(exc)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        timer.timeout.connect(poll_result)
+        generate.clicked.connect(generate_greeting)
+        dialog.exec()
 
     def _read_widget_values(self) -> dict:
         """把控件当前取值收集为 key->字符串 dict（不做校验）。"""
@@ -1179,6 +1720,8 @@ class PanelApp(
                 values[key] = CITY_CHOICES.get(text, "") if key == "CITY_CODE" else text
             elif ftype == "int":
                 values[key] = str(widget.value())
+            elif ftype == "multiline":
+                values[key] = widget.toPlainText()
             else:
                 values[key] = widget.text().strip()
         values["JOB_TYPE_PREFERENCE"] = normalize_job_type_preference(
@@ -1210,45 +1753,41 @@ class PanelApp(
     def save_config(self):
         values = self._collect_values()
         if values is None:
+            self.config_notice.dismiss()
             return
-        write_env_file(values)
+        if not self._persist_config(values):
+            return
         self.append_log(f"[面板] {time.strftime('%H:%M:%S')} 配置已保存到 .env")
-        QMessageBox.information(self, "保存配置", "配置已保存。运行中的任务不受影响，下次启动生效。")
+        self.statusBar().showMessage("配置已保存", 2500)
+        message = "配置已保存，下次启动任务时生效" if self.runner.running() else "配置已保存"
+        self.config_notice.show_message(message)
+
+    def _persist_config(self, values):
+        try:
+            write_env_file(values)
+        except (OSError, UnicodeError) as exc:
+            if isinstance(exc, PermissionError):
+                reason = "无法写入配置文件，请检查文件权限后重试"
+            elif isinstance(exc, UnicodeError):
+                reason = "配置中有无法保存的字符，请检查输入后重试"
+            else:
+                reason = "无法写入配置文件，请检查存储空间和文件状态后重试"
+            self.config_notice.show_message(f"配置保存失败：{reason}", kind="error")
+            self.append_log(f"[面板] {time.strftime('%H:%M:%S')} 配置保存失败：{exc}")
+            return False
+        return True
 
     # ---------------- 运行日志页 ----------------
-    def _build_run_page(self):
-        """运行与结果：日志监控与投递结果合并为两个 Tab。"""
-        tabs = QTabWidget()
-        self.run_tabs = tabs
-        tabs.addTab(self._build_log_page(), "运行日志")
-        tabs.addTab(self._build_result_page(), "投递结果")
-        tabs.currentChanged.connect(self._on_run_tab_changed)
-        return tabs
-
-    def _on_run_tab_changed(self, index):
-        # 切到结果 Tab 时刷新，避免看到过期数据
-        if index == 1:
-            try:
-                self.refresh_results()
-            except Exception as exc:
-                print(f"[面板] 刷新结果失败: {exc}")
-
     def _build_log_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         # 状态区：进度条 + 统计 + 当前岗位卡
-        status_card, status_layout = self._card((20, 16, 20, 18), 14)
-        head = QWidget()
-        head_layout = QHBoxLayout(head)
-        head_layout.setContentsMargins(0, 0, 0, 0)
-        head_layout.addWidget(self._label("运行监控", "section"))
-        head_layout.addStretch(1)
+        status_card = SectionCard("运行监控", "任务启动后这里实时显示评分进度与当前岗位。")
         self.run_state_chip = self._label("空闲", "statusChipIdle")
-        head_layout.addWidget(self.run_state_chip)
-        status_layout.addWidget(head)
+        status_card.header_actions.addWidget(self.run_state_chip)
 
         progress_row = QWidget()
         progress_layout = QHBoxLayout(progress_row)
@@ -1265,7 +1804,7 @@ class PanelApp(
         self.run_progress_label.setFixedWidth(132)
         self.run_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         progress_layout.addWidget(self.run_progress_label)
-        status_layout.addWidget(progress_row)
+        status_card.body.addWidget(progress_row)
 
         stats_row = QWidget()
         stats_layout = QHBoxLayout(stats_row)
@@ -1276,14 +1815,14 @@ class PanelApp(
         self.run_stat_today = self._stat_tile("今日投递", "0 / 0")
         for tile, _value in (self.run_stat_scored, self.run_stat_delivered,
                              self.run_stat_today):
-            stats_layout.addWidget(tile)
-        stats_layout.addStretch(1)
-        status_layout.addWidget(stats_row)
+            stats_layout.addWidget(tile, 1)
+        status_card.body.addWidget(stats_row)
 
-        job_card, job_layout = self._card((16, 12, 16, 12), 6)
+        job_card, job_layout = self._card((16, 13, 16, 13), 6)
         job_head = QWidget()
         job_head_layout = QHBoxLayout(job_head)
         job_head_layout.setContentsMargins(0, 0, 0, 0)
+        job_head_layout.setSpacing(8)
         job_head_layout.addWidget(self._label("当前岗位", "fieldLabel"))
         job_head_layout.addStretch(1)
         self.run_job_score_label = self._label("AI 分数 –", "scoreBadgeLow")
@@ -1295,26 +1834,30 @@ class PanelApp(
             "任务启动后，这里显示当前处理的岗位、公司与 AI 分数。", "muted", wrap=True
         )
         job_layout.addWidget(self.run_job_meta)
-        status_layout.addWidget(job_card)
+        status_card.body.addWidget(job_card)
         layout.addWidget(status_card)
 
-        card, card_layout = self._card((16, 14, 16, 16), 10)
+        card, card_layout = self._card((20, 16, 20, 18), 12)
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(10)
         toolbar_layout.addWidget(self._label("任务输出", "section"))
         toolbar_layout.addStretch(1)
         self.log_filter_ai = QCheckBox("只看 AI 相关")
+        self.log_filter_ai.setObjectName("chipCheck")
         self.log_filter_ai.setToolTip("只显示 [AI] 行；不影响日志写入")
         self.log_filter_ai.setCursor(Qt.PointingHandCursor)
         self.log_filter_ai.toggled.connect(self._rebuild_log_view)
         toolbar_layout.addWidget(self.log_filter_ai)
         self.log_filter_error = QCheckBox("只看错误")
+        self.log_filter_error.setObjectName("chipCheck")
         self.log_filter_error.setToolTip("只显示错误行；不影响日志写入")
         self.log_filter_error.setCursor(Qt.PointingHandCursor)
         self.log_filter_error.toggled.connect(self._rebuild_log_view)
         toolbar_layout.addWidget(self.log_filter_error)
         clear = QPushButton("清空日志")
+        clear.setObjectName("ghost")
         clear.setCursor(Qt.PointingHandCursor)
         clear.clicked.connect(self._clear_log)
         toolbar_layout.addWidget(clear)
@@ -1334,19 +1877,9 @@ class PanelApp(
 
     def _stat_tile(self, label, value):
         """统计小卡：返回 (卡片, 数值标签)。"""
-        tile = QFrame()
-        tile.setObjectName("inset")
+        tile = StatTile(label, value)
         tile.setMinimumWidth(128)
-        layout = QVBoxLayout(tile)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(2)
-        value_label = QLabel(value)
-        value_label.setObjectName("statValue")
-        label_label = QLabel(label)
-        label_label.setObjectName("statLabel")
-        layout.addWidget(value_label)
-        layout.addWidget(label_label)
-        return tile, value_label
+        return tile, tile.value_label
 
     def _clear_log(self):
         self.log_records = []
@@ -1595,11 +2128,15 @@ class PanelApp(
                 f"[面板] {time.strftime('%H:%M:%S')} 未确认候选人画像，将按基础画像运行"
             )
         # 先落盘当前面板配置，保证启动即用面板里的设置
-        write_env_file(values)
+        if not self._persist_config(values):
+            return
 
         msg = self.runner.start()
         if not self.runner.running():
+            self.config_notice.show_message("配置已保存，但任务未能启动", kind="error")
             QMessageBox.warning(self, "启动失败", msg)
+        else:
+            self.config_notice.show_message("配置已保存，任务已启动")
         self.append_log(f"[面板] {time.strftime('%H:%M:%S')} {msg}（面板配置已自动保存）")
 
     def stop_task(self):
@@ -1614,6 +2151,12 @@ class PanelApp(
             except queue.Empty:
                 break
             self._apply_platform_areas(generation, city_code, districts, error)
+        while True:
+            try:
+                generation, groups, error = self.industry_events.get_nowait()
+            except queue.Empty:
+                break
+            self._apply_platform_industries(generation, groups, error)
         while True:
             try:
                 generation, kind, payload = self.profile_events.get_nowait()
@@ -1649,12 +2192,30 @@ class PanelApp(
             self.btn_stop.setVisible(True)
         else:
             exit_code = self.runner.exit_code
-            self.status_label.setText("空闲" if exit_code is None else f"已结束 · 退出码 {exit_code}")
-            self._set_widget_style(
-                self.status_dot, "statusDotDone" if exit_code == 0 else "statusDotIdle"
+            manually_stopped = getattr(self.runner, "stop_requested", False)
+            self.status_label.setText(
+                format_exit_status(exit_code, manually_stopped)
             )
-            self._set_widget_style(self.run_state_chip, "statusChipIdle")
-            self.run_state_chip.setText("空闲")
+            if exit_code is None:
+                self._set_widget_style(self.status_dot, "statusDotIdle")
+                self._set_widget_style(self.run_state_chip, "statusChipIdle")
+                self.run_state_chip.setText("空闲")
+            elif manually_stopped:
+                self._set_widget_style(self.status_dot, "statusDotIdle")
+                self._set_widget_style(self.run_state_chip, "statusChipIdle")
+                self.run_state_chip.setText("已停止")
+            elif exit_code == 0:
+                self._set_widget_style(self.status_dot, "statusDotDone")
+                self._set_widget_style(self.run_state_chip, "statusChipOk")
+                self.run_state_chip.setText("正常结束")
+            elif exit_code == 130:
+                self._set_widget_style(self.status_dot, "statusDotIdle")
+                self._set_widget_style(self.run_state_chip, "statusChipWarn")
+                self.run_state_chip.setText("已中断")
+            else:
+                self._set_widget_style(self.status_dot, "statusDotIdle")
+                self._set_widget_style(self.run_state_chip, "statusChipWarn")
+                self.run_state_chip.setText("运行失败")
             self.btn_stop.setVisible(False)
             self.btn_start.setVisible(True)
 

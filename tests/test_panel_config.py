@@ -1,7 +1,10 @@
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import desktop_panel
 from panel_config_logic import (
     config_warnings,
     parse_hhmm,
@@ -48,7 +51,7 @@ class ValidateConfigValuesTests(unittest.TestCase):
             valid_values(WORK_TIME_START="9点30"), resume_exists=True
         )
         self.assertEqual(len(errors), 1)
-        self.assertIn("最早上班时间", errors[0])
+        self.assertIn("最早可接受上班时间", errors[0])
 
     def test_start_must_be_before_end(self):
         errors = validate_config_values(
@@ -121,14 +124,17 @@ class PanelSettingTransmissionTests(unittest.TestCase):
     def test_every_config_field_is_in_exactly_one_settings_section(self):
         source_path = Path(__file__).parents[1] / "desktop_panel.py"
         module = ast.parse(source_path.read_text(encoding="utf-8"))
-        assignments = {
-            target.id: ast.literal_eval(node.value)
-            for node in module.body
-            if isinstance(node, ast.Assign)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-            and target.id in {"FIELDS", "SETTINGS_SECTIONS", "ADVANCED_SECTIONS"}
-        }
+        assignments = {}
+        for node in module.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id == "FIELDS":
+                    assignments[target.id] = desktop_panel.FIELDS
+                elif target.id in {"SETTINGS_SECTIONS", "ADVANCED_SECTIONS"}:
+                    assignments[target.id] = ast.literal_eval(node.value)
         field_keys = {field[0] for field in assignments["FIELDS"]}
         section_keys = [key for _, keys in (
             assignments["SETTINGS_SECTIONS"] + assignments["ADVANCED_SECTIONS"]
@@ -136,6 +142,98 @@ class PanelSettingTransmissionTests(unittest.TestCase):
 
         self.assertEqual(set(section_keys), field_keys)
         self.assertEqual(len(section_keys), len(set(section_keys)))
+
+        settings = dict(assignments["SETTINGS_SECTIONS"])
+        advanced = dict(assignments["ADVANCED_SECTIONS"])
+        self.assertEqual(
+            [title for title, _keys in assignments["SETTINGS_SECTIONS"]],
+            [
+                "模型接口（必填）",
+                "简历与目标岗位",
+                "本轮任务",
+                "在哪儿找工作",
+                "作息与福利",
+                "打招呼语",
+                "可选画像搜索",
+            ],
+        )
+        self.assertIn("TEST_LIMIT", settings["本轮任务"])
+        self.assertEqual(
+            settings["本轮任务"],
+            ["DRY_RUN", "TEST_LIMIT", "MATCH_THRESHOLD", "DAILY_LIMIT"],
+        )
+        self.assertEqual(
+            settings["在哪儿找工作"][:3],
+            ["CITY_CODE", "PLATFORM_AREA_FILTER", "AREA_FILTER"],
+        )
+        self.assertIn("AREA_FILTER", settings["在哪儿找工作"])
+        self.assertIn("DELIVER_MAX_PAGES", advanced["采集细节"])
+        self.assertNotIn("AREA_FILTER", advanced["采集细节"])
+        self.assertIn("GREETING_PROMPT", settings["打招呼语"])
+        self.assertEqual(settings["可选画像搜索"], ["TAVILY_ENABLED", "TAVILY_API_KEY"])
+
+
+class SettingsFeedbackTests(unittest.TestCase):
+    def test_save_config_shows_temporary_non_modal_confirmation(self):
+        messages = []
+        app = SimpleNamespace(
+            _collect_values=lambda: {"CITY_CODE": "101280600"},
+            append_log=lambda _message: None,
+            config_notice=Mock(),
+            runner=SimpleNamespace(running=lambda: False),
+            statusBar=lambda: SimpleNamespace(
+                showMessage=lambda *args: messages.append(args)
+            ),
+        )
+        app._persist_config = lambda values: desktop_panel.PanelApp._persist_config(app, values)
+
+        with patch.object(desktop_panel, "write_env_file") as write_env, patch.object(
+            desktop_panel.QMessageBox, "information"
+        ) as show_modal:
+            desktop_panel.PanelApp.save_config(app)
+
+        write_env.assert_called_once_with({"CITY_CODE": "101280600"})
+        self.assertEqual(messages, [("配置已保存", 2500)])
+        app.config_notice.show_message.assert_called_once_with("配置已保存")
+        show_modal.assert_not_called()
+
+    def test_failed_write_shows_error_and_never_confirms_success(self):
+        notice = Mock()
+        app = SimpleNamespace(
+            _collect_values=lambda: {"CITY_CODE": "101280600"},
+            append_log=Mock(),
+            config_notice=notice,
+            statusBar=Mock(),
+        )
+        app._persist_config = lambda values: desktop_panel.PanelApp._persist_config(app, values)
+
+        with patch.object(desktop_panel, "write_env_file", side_effect=PermissionError("read only")):
+            desktop_panel.PanelApp.save_config(app)
+
+        notice.show_message.assert_called_once()
+        self.assertIn("配置保存失败", notice.show_message.call_args.args[0])
+        self.assertEqual(notice.show_message.call_args.kwargs, {"kind": "error"})
+        app.statusBar.assert_not_called()
+
+    def test_invalid_values_clear_previous_confirmation_without_writing(self):
+        app = SimpleNamespace(_collect_values=lambda: None, config_notice=Mock())
+        with patch.object(desktop_panel, "write_env_file") as write_env:
+            desktop_panel.PanelApp.save_config(app)
+        write_env.assert_not_called()
+        app.config_notice.dismiss.assert_called_once()
+        app.config_notice.show_message.assert_not_called()
+
+    def test_running_task_save_describes_when_new_settings_take_effect(self):
+        app = SimpleNamespace(
+            _collect_values=lambda: {"CITY_CODE": "101280600"},
+            _persist_config=lambda _values: True,
+            config_notice=Mock(),
+            append_log=Mock(),
+            statusBar=Mock(),
+            runner=SimpleNamespace(running=lambda: True),
+        )
+        desktop_panel.PanelApp.save_config(app)
+        app.config_notice.show_message.assert_called_once_with("配置已保存，下次启动任务时生效")
 
 
 if __name__ == "__main__":

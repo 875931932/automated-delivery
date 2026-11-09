@@ -6,8 +6,9 @@ from pathlib import Path
 
 import requests
 
+from app_paths import get_resource_dir
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = get_resource_dir()
 CITY_CODES_PATH = BASE_DIR / "city_codes.json"
 BUSINESS_DISTRICT_URL = "https://www.zhipin.com/wapi/zpgeek/businessDistrict.json"
 

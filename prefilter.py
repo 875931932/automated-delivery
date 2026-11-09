@@ -688,8 +688,11 @@ def work_condition_reject(jd_text: str, cfg: dict):
             e_min += 12 * 60
         if e_min < s_min:  # 跨天的情况（如 熬夜班），保守放行
             continue
-        if start_limit is not None and s_min > start_limit:
-            return f"上班时间过晚（{s_raw} 上班）"
+        if start_limit is not None and s_min < start_limit:
+            return (
+                f"上班时间早于可接受时间（{s_raw} 上班，"
+                f"最早可接受 {cfg['work_time_start']}）"
+            )
         if end_limit is not None and not flexible and e_min > end_limit:
             return f"下班时间过晚（{e_raw} 下班，疑似加班）"
     return None

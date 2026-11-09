@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 import boss_spider
 import delivery_config
+import desktop_panel
 import platform_locations
 
 
@@ -21,6 +22,7 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             "AI_REASONING_EFFORT": "HIGH",
             "AI_TIMEOUT": "41",
             "AI_MAX_RETRIES": "3",
+            "GREETING_PROMPT": "自定义招呼语 ${岗位名}\n第二行",
             "TAVILY_ENABLED": "false",
             "TAVILY_API_KEY": "test-search-key",
             "TAVILY_TIMEOUT": "8",
@@ -55,11 +57,14 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             "TEST_LIMIT": "2",
             "LOGIN_WAIT": "15",
             "CITY_CODE": "101280600",
+            "BROWSER_PATH": "",
+            "BROWSER_BACKGROUND": "false",
         }
         expected = {
             "ai_base_url": values["AI_BASE_URL"],
             "ai_api_key": values["AI_API_KEY"],
             "ai_model": values["AI_MODEL"],
+            "greeting_prompt": values["GREETING_PROMPT"],
             "ai_reasoning_effort": "high",
             "ai_timeout": 41,
             "ai_max_retries": 3,
@@ -85,6 +90,7 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             "humanize_enable": False,
             "favorite_score": 88,
             "keep_login": False,
+            "browser_background": False,
             "detail_delay": (5, 10),
             "rest_day_require": "双休",
             "welfare_require": ["五险一金", "带薪年假"],
@@ -95,18 +101,12 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             "test_limit": 2,
             "login_wait": 15,
         }
-        panel_source = Path(__file__).parents[1] / "desktop_panel.py"
-        panel_module = ast.parse(panel_source.read_text(encoding="utf-8"))
-        panel_fields = next(
-            ast.literal_eval(node.value)
-            for node in panel_module.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "FIELDS"
-                for target in node.targets
-            )
+        # Retain old favorite thresholds when loading saved configs, without
+        # presenting an automatic-favorite control in the current workflow.
+        self.assertEqual(
+            {field[0] for field in desktop_panel.FIELDS},
+            set(values) - {"FAVORITE_SCORE"},
         )
-        self.assertTrue({field[0] for field in panel_fields}.issubset(values))
 
         original_config = delivery_config.DELIVER_CONFIG
         original_spider_config = copy.deepcopy(boss_spider.Config)
@@ -122,7 +122,10 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             ):
                 loaded = importlib.reload(delivery_config)
                 config = dict(loaded.DELIVER_CONFIG)
+                self.assertEqual(config["greeting_prompt"], values["GREETING_PROMPT"])
                 spider_config = boss_spider.Config
+                loaded.apply_search_settings(config, spider_config)
+                self.assertFalse(spider_config["browser_background"])
                 self.assertEqual(spider_config["city_id"], "101280600")
                 self.assertEqual(
                     parse_qs(urlparse(spider_config["start_url"]).query)["city"],
@@ -159,6 +162,43 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
         for key, value in expected.items():
             with self.subTest(key=key):
                 self.assertEqual(config[key], value)
+
+    def test_importing_saved_platform_areas_does_not_make_network_requests(self):
+        original_config = delivery_config.DELIVER_CONFIG
+        original_spider_config = copy.deepcopy(boss_spider.Config)
+        try:
+            with patch.dict(os.environ, {
+                "PLATFORM_AREA_FILTER": "440305",
+                "CITY_CODE": "101280600",
+            }, clear=False), patch.object(
+                platform_locations, "fetch_platform_districts"
+            ) as fetch_districts:
+                loaded = importlib.reload(delivery_config)
+                self.assertEqual(
+                    loaded.DELIVER_CONFIG["platform_area_filter"], ["440305"]
+                )
+                fetch_districts.assert_not_called()
+        finally:
+            delivery_config.DELIVER_CONFIG = original_config
+            boss_spider.Config.clear()
+            boss_spider.Config.update(original_spider_config)
+
+    def test_default_page_cap_is_dynamic_safety_ceiling_and_clamps_env_values(self):
+        original_config = delivery_config.DELIVER_CONFIG
+        original_spider_config = copy.deepcopy(boss_spider.Config)
+        try:
+            for raw, expected in (("", 10), ("99", 50), ("0", 1)):
+                with self.subTest(raw=raw), patch.dict(
+                    os.environ, {"DELIVER_MAX_PAGES": raw}, clear=False
+                ), patch("dotenv.load_dotenv"):
+                    if not raw:
+                        os.environ.pop("DELIVER_MAX_PAGES", None)
+                    loaded = importlib.reload(delivery_config)
+                    self.assertEqual(loaded.DELIVER_CONFIG["deliver_max_pages"], expected)
+        finally:
+            delivery_config.DELIVER_CONFIG = original_config
+            boss_spider.Config.clear()
+            boss_spider.Config.update(original_spider_config)
 
 
 if __name__ == "__main__":

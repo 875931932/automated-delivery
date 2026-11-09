@@ -15,6 +15,7 @@ _RED = ("#B42318", "#FEF3F2")
 
 STATUS_DISPLAY = {
     "delivered": ("投递成功", *_GREEN),
+    "already_contacted": ("已沟通（跳过）", *_GRAY),
     "dry_run": ("干跑可投", *_GREEN),
     "dry_run_ready": ("干跑可投", *_GREEN),
     "below_threshold": ("低于分数线", *_GRAY),
@@ -62,6 +63,18 @@ def status_display(status: str) -> tuple:
     if any(marker in lowered for marker in _REJECT_MARKERS):
         return ("已过滤", *_RED)
     return (key or "未知", *_GRAY)
+
+
+def summarize_result_rows(rows) -> dict[str, int]:
+    """汇总结果页首屏指标，区分真实投递与干跑状态。"""
+    statuses = [str(row.get("投递状态", "")).strip().lower() for row in rows]
+    return {
+        "total": len(statuses),
+        "delivered": sum(status == "delivered" for status in statuses),
+        "dry_run": sum(status in {"dry_run", "dry_run_ready"} for status in statuses),
+        "review": sum(status == "scope_review" for status in statuses),
+        "failed": sum("fail" in status for status in statuses),
+    }
 
 
 def filter_result_rows(rows, status="全部", score_min=0, score_max=100,
@@ -152,13 +165,55 @@ def update_result_mark(path, job_id, mark) -> int:
     return updated
 
 
-def _chips_html(items, chip_class="gap") -> str:
+def _chips_html(items, chip_class="chipGap") -> str:
     parts = []
     for item in items:
         text = str(item).strip()
         if text:
             parts.append(f'<span class="chip {chip_class}">{html.escape(text)}</span>')
-    return " ".join(parts)
+    # QTextBrowser 不支持 span 的 margin-right，用 &nbsp; 拉开间距
+    return "&nbsp;&nbsp;".join(parts)
+
+
+# 详情页样式。
+# 注意：QTextBrowser 只支持有限 CSS —— 可用的是 background-color、margin、
+# font 系列、text-align；padding / border / border-radius / flex / line-height 均无效。
+# 因此这里的"卡片"用 外层背景 div + 内层 margin div 组合出内边距效果，
+# "分段"靠标题字号/颜色差异 + 区块 margin 来拉开层次。
+_DETAIL_STYLE = """
+<style>
+body{color:#101828;}
+.sec{margin-bottom:26px;}
+.secTitle{font-size:15px;font-weight:bold;color:#1F3DAD;margin-bottom:12px;}
+.card{background:#F1F4F9;margin-bottom:18px;}
+.cardIn{margin:15px 17px;}
+.cardHi{background:#E8F0FE;}
+.row{color:#475467;margin-bottom:7px;}
+.greeting{color:#101828;font-size:13px;}
+.chip{background:#FFFFFF;color:#1F3DAD;}
+.chipGap{background:#FEF3F2;color:#B42318;}
+.chipWarn{background:#FEF6E7;color:#93370D;}
+.tag{background:#DCE4F6;color:#2B3A63;}
+.rule{background:#DCE3EF;font-size:2px;}
+.k{color:#101828;font-weight:bold;}
+.muted{color:#667085;}
+.scoreNote{background:#FEF6E7;color:#93370D;margin-bottom:16px;}
+.scoreNoteIn{margin:12px 14px;}
+a{color:#2F5BEA;text-decoration:none;font-weight:bold;}
+</style>
+"""
+
+
+def _escape_lines(text: str) -> str:
+    """把多行文本拆成独立 div —— <br> 会让后续行脱离父级缩进。"""
+    lines = [line for line in str(text).splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    return "".join(f'<div>{html.escape(line)}</div>' for line in lines)
 
 
 def _split_field(value) -> list:
@@ -175,94 +230,112 @@ def _profile_details_html(value) -> str:
     try:
         items = json.loads(text)
     except (ValueError, TypeError):
-        return f'<pre class="json">{html.escape(text)}</pre>'
+        return (
+            '<div class="card"><div class="cardIn">'
+            f'<div class="row">{_escape_lines(text)}</div></div></div>'
+        )
     if not isinstance(items, list):
-        return f'<pre class="json">{html.escape(text)}</pre>'
-    rows = []
+        return (
+            '<div class="card"><div class="cardIn">'
+            f'<div class="row">{_escape_lines(text)}</div></div></div>'
+        )
+
+    blocks = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        rows.append(
-            "<tr><td>{name}</td><td>{score}</td><td>{fit}</td><td>{reason}</td></tr>".format(
-                name=html.escape(str(item.get("profile_name") or item.get("profile_id") or "")),
-                score=html.escape(str(item.get("score", ""))),
-                fit=html.escape(str(item.get("role_fit", ""))),
-                reason=html.escape(str(item.get("reason", ""))),
+        name = item.get("profile_name") or item.get("profile_id") or "未命名画像"
+        metrics = []
+        for label, key in (("岗位匹配", "score"), ("职能契合", "role_fit")):
+            value = item.get(key)
+            if value is not None and str(value).strip():
+                metrics.append(f"{label} {html.escape(str(value))}")
+        reason = str(item.get("reason") or "").strip()
+
+        inner = f'<div class="tag">{html.escape(str(name))}</div>'
+        if metrics:
+            chips = "&nbsp;&nbsp;".join(
+                f'<span class="chip">{m}</span>' for m in metrics
             )
+            inner += f'<div style="margin-top:10px;">{chips}</div>'
+        if reason:
+            inner += (
+                f'<div class="row" style="margin-top:11px;">'
+                f'{_escape_lines(reason)}</div>'
+            )
+        blocks.append(
+            '<div class="card"><div class="cardIn">' + inner + "</div></div>"
         )
-    if not rows:
-        return f'<pre class="json">{html.escape(text)}</pre>'
-    return (
-        '<table class="mini"><tr><th>画像</th><th>分数</th><th>契合</th><th>理由</th></tr>'
-        + "".join(rows) + "</table>"
-    )
+    return "".join(blocks)
+
+
+def _join_sections(sections) -> str:
+    """把各分区拼起来，之间插入细分隔线，形成清晰的段落层次。"""
+    if not sections:
+        return ""
+    parts = []
+    for index, section in enumerate(sections):
+        if index:
+            parts.append('<div class="rule">&nbsp;</div>')
+        parts.append(section)
+    return "".join(parts)
 
 
 def build_result_detail_html(row: dict) -> str:
-    """把结果行渲染为详情区 HTML（评估摘要 / 缺口 chips / 画像评估 / 详情链接）。"""
-    title = html.escape(row.get("工作名称", "") or "未命名岗位")
-    company = html.escape(row.get("公司", ""))
-    salary = html.escape(row.get("工资", ""))
-    label, color, bg = status_display(row.get("投递状态", ""))
-    score = row_score(row)
-    score_text = f"{score:g}" if score is not None else "-"
-    score_source = (
-        '<span class="sub">（上次有效评分，本次评分失败）</span>'
-        if str(row.get("历史有效评分", "")).lower() == "true"
-        else ""
+    """渲染选中岗位的主要信息；评估证据由 build_result_evidence_html 单独渲染。"""
+    sections = []
+    if str(row.get("历史有效评分", "")).lower() == "true":
+        score = row_score(row)
+        score_text = f" {score:g}" if score is not None else ""
+        sections.append(
+            '<div class="scoreNote"><div class="scoreNoteIn">'
+            f'本次评分失败，当前匹配分沿用上次有效评分{score_text}</div></div>'
+        )
+
+    greeting = str(row.get("打招呼语", "")).strip()
+    greeting_html = (
+        f'<div class="greeting">{_escape_lines(greeting)}</div>'
+        if greeting else '<div class="muted">暂无生成的招呼语</div>'
     )
-
-    sections = [
-        f'<div class="head"><span class="title">{title}</span> '
-        f'<span class="sub">{company} · {salary}</span> '
-        f'<span class="chip status" style="color:{color};background:{bg}">'
-        f'{html.escape(label)}</span> '
-        f'<span class="chip score">AI 匹配分 {score_text}</span> {score_source}</div>'
-    ]
-
-    summary = html.escape(str(row.get("AI匹配理由", "")).strip())
-    if summary:
-        sections.append(f'<div class="sec"><div class="secTitle">评估摘要</div>{summary}</div>')
-
-    gaps = _split_field(row.get("硬性缺口", ""))
-    unverified = _split_field(row.get("未验证要求", ""))
-    if gaps or unverified:
-        body = ""
-        if gaps:
-            body += '<div class="row"><span class="label">硬性缺口</span>' + _chips_html(gaps, "gap") + "</div>"
-        if unverified:
-            body += '<div class="row"><span class="label">未验证要求</span>' + _chips_html(unverified, "warn") + "</div>"
-        sections.append(f'<div class="sec"><div class="secTitle">缺口与未验证</div>{body}</div>')
-
-    extras = []
-    for key, label in (
-        ("JD要求分层", "JD 原文要求（模型提取）"), ("加分项命中", "加分项命中"),
-        ("加分项缺口", "加分项缺口"), ("简历证据", "简历证据"),
-        ("筛选原因", "筛选结果"), ("技能匹配诊断", "标签诊断（仅供参考）"),
-        ("打招呼语", "打招呼语"), ("搜索来源关键词", "搜索关键词"),
-    ):
-        text = str(row.get(key, "")).strip()
-        if text:
-            extras.append(
-                f'<div class="row"><span class="label">{label}</span>'
-                f'<span class="text">{html.escape(text)}</span></div>'
-            )
-    if extras:
-        sections.append('<div class="sec"><div class="secTitle">补充信息</div>' + "".join(extras) + "</div>")
+    sections.append(
+        '<div class="sec"><div class="secTitle">打招呼语</div>'
+        '<div class="card cardHi"><div class="cardIn">'
+        f'{greeting_html}</div></div></div>'
+    )
 
     profile_html = _profile_details_html(row.get("岗位画像评估详情", ""))
     if profile_html:
         sections.append(
-            '<div class="sec"><div class="secTitle">岗位画像评估详情（简化）</div>'
+            '<div class="sec"><div class="secTitle">岗位画像评估</div>'
             + profile_html + "</div>"
+        )
+    else:
+        note = str(row.get("AI匹配理由") or row.get("筛选原因") or "").strip()
+        note_html = (
+            f'<div class="row">{_escape_lines(note)}</div>'
+            if note else '<div class="muted">当前记录未生成岗位画像评估</div>'
+        )
+        sections.append(
+            '<div class="sec"><div class="secTitle">岗位画像评估</div>'
+            '<div class="card"><div class="cardIn">'
+            f'{note_html}</div></div></div>'
+        )
+
+    keyword = str(row.get("搜索来源关键词", "")).strip()
+    if keyword:
+        sections.append(
+            '<div class="sec"><div class="secTitle">搜索关键词</div>'
+            '<div class="card"><div class="cardIn">'
+            f'<div class="row">{html.escape(keyword)}</div></div></div></div>'
         )
 
     link = str(row.get("详情链接", "")).strip()
-    if link:
+    if link.lower().startswith(("https://", "http://")):
         safe_link = html.escape(link, quote=True)
         sections.append(
-            f'<div class="sec"><div class="secTitle">详情链接</div>'
-            f'<a href="{safe_link}">{safe_link}</a></div>'
+            '<div class="sec"><div class="secTitle">岗位链接</div>'
+            '<div class="card"><div class="cardIn">'
+            f'<a href="{safe_link}">打开岗位详情</a></div></div></div>'
         )
 
     meta_bits = []
@@ -274,34 +347,63 @@ def build_result_detail_html(row: dict) -> str:
     ):
         text = str(row.get(key, "")).strip()
         if text:
-            meta_bits.append(f"{label}：{html.escape(text)}")
+            # 标签与值保持同一段文本，便于复制与检索
+            meta_bits.append(
+                f'<div class="row">{label}：{html.escape(text)}</div>'
+            )
     if meta_bits:
-        sections.append('<div class="sec meta">' + " ｜ ".join(meta_bits) + "</div>")
+        sections.append(
+            '<div class="sec"><div class="secTitle">岗位信息</div>'
+            '<div class="card"><div class="cardIn">'
+            f'{"".join(meta_bits)}</div></div></div>'
+        )
 
-    return (
-        '<style>'
-        'body{color:#101828;}'
-        '.head{font-size:14px;margin-bottom:2px;} '
-        '.title{font-weight:bold;font-size:16px;color:#101828;} '
-        '.sub{color:#667085;font-size:12px;} '
-        '.chip{border-radius:10px;padding:3px 10px;font-size:11px;margin-left:6px;'
-        'display:inline-block;border:1px solid transparent;} '
-        '.chip.score{background:#EEF3FE;color:#1F3DAD;border-color:#D9E3FD;} '
-        '.chip.gap{background:#FEF3F2;color:#B42318;border-color:#FBD5D1;margin-right:5px;} '
-        '.chip.warn{background:#FFFAEB;color:#93370D;border-color:#FDE3A7;margin-right:5px;} '
-        '.sec{margin-top:16px;padding-top:12px;border-top:1px solid #ECEEF2;} '
-        '.secTitle{font-weight:bold;color:#344054;margin-bottom:8px;font-size:13px;} '
-        '.row{margin-bottom:6px;line-height:1.6;} '
-        '.label{color:#667085;font-size:12px;margin-right:8px;} '
-        '.text{color:#101828;font-size:13px;} '
-        '.meta{color:#667085;font-size:12px;line-height:1.7;} '
-        'pre.json{background:#FAFBFC;border:1px solid #E7E9EE;border-radius:8px;padding:10px;'
-        'font-size:11px;white-space:pre-wrap;color:#344054;} '
-        'table.mini{border-collapse:collapse;font-size:12px;width:100%;} '
-        'table.mini td,table.mini th{border:1px solid #E7E9EE;padding:6px 8px;'
-        'text-align:left;color:#344054;background:#FAFBFC;} '
-        'table.mini th{font-weight:bold;color:#101828;} '
-        'a{color:#2F5BEA;text-decoration:none;} a:hover{text-decoration:underline;}'
-        "</style>"
-        + "".join(sections)
-    )
+    return _DETAIL_STYLE + _join_sections(sections)
+
+
+def build_result_evidence_html(row: dict) -> str:
+    """渲染非首要评估信息，供用户主动展开查看。"""
+    sections = []
+    gaps = _split_field(row.get("硬性缺口", ""))
+    unverified = _split_field(row.get("未验证要求", ""))
+    if gaps or unverified:
+        body = ""
+        if gaps:
+            body += (
+                '<div class="row"><span class="k">硬性缺口：</span>'
+                + _chips_html(gaps, "chipGap") + "</div>"
+            )
+        if unverified:
+            body += (
+                '<div class="row"><span class="k">未验证要求：</span>'
+                + _chips_html(unverified, "chipWarn") + "</div>"
+            )
+        sections.append(
+            '<div class="sec"><div class="secTitle">缺口与未验证</div>'
+            '<div class="card"><div class="cardIn">'
+            + body + "</div></div></div>"
+        )
+
+    for key, label in (
+        ("JD要求分层", "JD 要求分层"),
+        ("加分项命中", "加分项命中"),
+        ("加分项缺口", "加分项缺口"),
+        ("简历证据", "简历证据"),
+        ("筛选原因", "筛选结果"),
+        ("技能匹配诊断", "标签诊断（仅供参考）"),
+        ("本地预判", "本地预判（仅供参考）"),
+    ):
+        text = str(row.get(key, "")).strip()
+        if text:
+            sections.append(
+                f'<div class="sec"><div class="secTitle">{label}</div>'
+                '<div class="card"><div class="cardIn">'
+                f'<div class="row">{_escape_lines(text)}</div></div></div></div>'
+            )
+
+    if not sections:
+        sections.append(
+            '<div class="sec"><div class="card"><div class="cardIn">'
+            '<div class="muted">暂无其他评估证据</div></div></div></div>'
+        )
+    return _DETAIL_STYLE + _join_sections(sections)

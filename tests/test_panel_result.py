@@ -5,12 +5,14 @@ import unittest
 
 from delivery_config import RESULT_FIELDS
 from panel_result_logic import (
+    build_result_evidence_html,
     build_result_detail_html,
     deduplicate_result_rows,
     filter_result_rows,
     row_score,
     score_value,
     status_display,
+    summarize_result_rows,
     update_result_mark,
 )
 
@@ -51,6 +53,11 @@ class ScoreValueTests(unittest.TestCase):
 
 
 class StatusDisplayTests(unittest.TestCase):
+    def test_already_contacted_is_a_neutral_skip_not_a_new_delivery(self):
+        label, color, _bg = status_display("already_contacted")
+        self.assertEqual(label, "已沟通（跳过）")
+        self.assertEqual(color, "#475467")
+
     def test_delivered_and_dry_run_are_green(self):
         for status in ("delivered", "dry_run"):
             label, color, bg = status_display(status)
@@ -72,6 +79,36 @@ class StatusDisplayTests(unittest.TestCase):
         self.assertEqual(color, "#475467")
         label, color, _bg = status_display("brand_new_failed_status")
         self.assertEqual(color, "#B42318")
+
+
+class SummarizeResultRowsTests(unittest.TestCase):
+    def test_existing_conversation_does_not_count_as_sent_or_failed(self):
+        self.assertEqual(
+            summarize_result_rows([make_row(投递状态="already_contacted")]),
+            {"total": 1, "delivered": 0, "dry_run": 0, "review": 0, "failed": 0},
+        )
+
+    def test_separates_deliveries_dry_runs_reviews_and_failures(self):
+        rows = [
+            make_row(投递状态="delivered"),
+            make_row(投递状态="dry_run"),
+            make_row(投递状态="dry_run_ready"),
+            make_row(投递状态="scope_review"),
+            make_row(投递状态="match_failed"),
+            make_row(投递状态="greeting_failed"),
+            make_row(投递状态="below_threshold"),
+        ]
+
+        self.assertEqual(
+            summarize_result_rows(rows),
+            {
+                "total": 7,
+                "delivered": 1,
+                "dry_run": 2,
+                "review": 1,
+                "failed": 2,
+            },
+        )
 
 
 class FilterResultRowsTests(unittest.TestCase):
@@ -206,29 +243,94 @@ class UpdateResultMarkTests(unittest.TestCase):
 
 
 class BuildResultDetailHtmlTests(unittest.TestCase):
-    def test_contains_title_score_and_link(self):
-        html_text = build_result_detail_html(make_row(详情链接="https://example.com/job"))
-        self.assertIn("AI应用开发实习生", html_text)
-        self.assertIn("AI 匹配分 85", html_text)
-        self.assertIn('href="https://example.com/job"', html_text)
+    def test_renders_priority_fields_in_readable_blocks(self):
+        html_text = build_result_detail_html(make_row(
+            打招呼语="您好，我用 Python 独立开发过 AI 应用。\n方便的话可以聊聊。",
+            搜索来源关键词="AI应用开发",
+            岗位画像评估详情=(
+                '[{"profile_id": "auto-target", "score": 72, "role_fit": 75, '
+                '"reason": "项目经验匹配，Java与RPA经验未验证"}]'
+            ),
+            详情链接="https://example.com/job",
+            工作性质="实习",
+            区域="深圳 南山区 科技园",
+            上班时间="09:00-18:00",
+            主岗位画像="auto-target",
+            职业范围状态="in_scope",
+            投递时间="2026-11-09 01:01:42",
+        ))
 
-    def test_escapes_html_in_fields(self):
-        html_text = build_result_detail_html(make_row(工作名称="<script>alert(1)</script>"))
+        self.assertIn("打招呼语", html_text)
+        self.assertIn("您好，我用 Python 独立开发过 AI 应用。", html_text)
+        self.assertIn("搜索关键词", html_text)
+        self.assertIn("AI应用开发", html_text)
+        self.assertIn("auto-target", html_text)
+        self.assertIn("岗位匹配 72", html_text)
+        self.assertIn("职能契合 75", html_text)
+        self.assertIn("Java与RPA经验未验证", html_text)
+        self.assertIn('href="https://example.com/job"', html_text)
+        self.assertIn("工作地点：深圳 南山区 科技园", html_text)
+        self.assertIn("记录时间：2026-11-09 01:01:42", html_text)
+        self.assertNotIn("<table", html_text)
+
+    def test_escapes_html_in_visible_fields(self):
+        html_text = build_result_detail_html(make_row(
+            打招呼语="<script>alert(1)</script>",
+            岗位画像评估详情=(
+                '[{"profile_id": "p1", "score": 82, "role_fit": 80, '
+                '"reason": "<img src=x onerror=alert(1)>"}]'
+            ),
+        ))
+
         self.assertNotIn("<script>", html_text)
+        self.assertNotIn("<img", html_text)
         self.assertIn("&lt;script&gt;", html_text)
+        self.assertIn("&lt;img", html_text)
+
+    def test_keeps_evidence_in_the_separate_expanded_section(self):
+        row = make_row(
+            AI匹配理由="岗位职责与项目经历相关。",
+            硬性缺口="缺少Java经验",
+            未验证要求="实习时长未确认",
+            JD要求分层="必须熟悉Java",
+            加分项命中="具备Python项目经验",
+            简历证据="候选人独立开发AI应用",
+            筛选原因="范围待复核",
+            技能匹配诊断="技能标签仅供参考",
+            本地预判="pass:未发现硬性冲突",
+        )
+
+        primary_html = build_result_detail_html(row)
+        evidence_html = build_result_evidence_html(row)
+
+        self.assertNotIn("简历证据", primary_html)
+        self.assertNotIn("必须熟悉Java", primary_html)
+        self.assertNotIn("岗位职责与项目经历相关", evidence_html)
+        self.assertIn("缺少Java经验", evidence_html)
+        self.assertIn("实习时长未确认", evidence_html)
+        self.assertIn("必须熟悉Java", evidence_html)
+        self.assertIn("候选人独立开发AI应用", evidence_html)
+        self.assertIn("本地预判（仅供参考）", evidence_html)
+
+    def test_only_renders_http_job_links(self):
+        html_text = build_result_detail_html(make_row(详情链接="javascript:alert(1)"))
+
+        self.assertNotIn("javascript:", html_text)
+        self.assertNotIn("href=", html_text)
 
     def test_renders_gap_chips(self):
-        html_text = build_result_detail_html(make_row(硬性缺口="缺少大模型经验；未写微调"))
+        html_text = build_result_evidence_html(make_row(
+            硬性缺口="缺少大模型经验；未写微调"
+        ))
         self.assertIn("缺少大模型经验", html_text)
         self.assertIn("未写微调", html_text)
 
-    def test_renders_profile_details_simplified(self):
+    def test_profile_assessment_handles_invalid_json_as_text(self):
         html_text = build_result_detail_html(make_row(
-            岗位画像评估详情='[{"profile_id": "p1", "profile_name": "AI应用", '
-                            '"score": 82, "role_fit": 80, "reason": "匹配"}]',
+            岗位画像评估详情="评估数据暂不可用"
         ))
-        self.assertIn("AI应用", html_text)
-        self.assertIn("82", html_text)
+
+        self.assertIn("评估数据暂不可用", html_text)
 
 
 if __name__ == "__main__":

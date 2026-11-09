@@ -69,6 +69,24 @@ class WorkScheduleSettingsTests(unittest.TestCase):
         self.assertIsNone(work_condition_reject("双休，弹性工作", config))
         self.assertIsNone(work_condition_reject("不单休", config))
 
+    def test_earliest_start_setting_allows_later_starts_and_rejects_earlier_ones(self):
+        config = {
+            "rest_day_require": "不限",
+            "work_time_start": "09:00",
+            "work_time_end": "",
+        }
+        jd = (
+            "公司工作时间及福利: 上午10:00 - 下午08:00；排班轮休；"
+            "福利: 五险、带薪旅游假、生日福利、免费工装、团建聚餐、零食下午茶、全勤奖"
+        )
+
+        self.assertIsNone(work_condition_reject(jd, config))
+        self.assertIsNone(work_condition_reject("上午09:00 - 下午06:00", config))
+        self.assertEqual(
+            work_condition_reject("上午08:30 - 下午05:30", config),
+            "上班时间早于可接受时间（上午08:30 上班，最早可接受 09:00）",
+        )
+
     def test_requested_welfare_triggers_company_lookup_only_when_missing_from_jd(self):
         config = {
             "rest_day_require": "不限",
@@ -85,6 +103,11 @@ class WorkScheduleSettingsTests(unittest.TestCase):
 class DeliveryBrowserSettingsTests(unittest.TestCase):
     def test_delivery_detail_dwell_uses_configured_range(self):
         class Button:
+            text = "立即沟通"
+
+            def attr(inner_self, _name):
+                return None
+
             def click(inner_self):
                 page.url = "https://example.invalid/chat"
 
@@ -94,6 +117,7 @@ class DeliveryBrowserSettingsTests(unittest.TestCase):
             scroll=SimpleNamespace(down=Mock(), to_top=Mock()),
             get=Mock(),
             ele=Mock(return_value=Button()),
+            eles=Mock(return_value=[Button()]),
         )
         deliverer = AutoDeliverer.__new__(AutoDeliverer)
         deliverer.page = page
@@ -114,13 +138,16 @@ class DeliveryBrowserSettingsTests(unittest.TestCase):
     def test_post_delivery_browsing_starts_from_the_configured_search_page(self):
         visits = []
         deliverer = AutoDeliverer.__new__(AutoDeliverer)
-        deliverer.page = SimpleNamespace(get=visits.append)
+        deliverer.page = SimpleNamespace(
+            get=visits.append,
+            url="https://www.zhipin.com/web/geek/chat",
+        )
         deliverer.browser_lock = threading.RLock()
         deliverer._human_browse_job_list = [{"encryptJobId": "job-1"}]
         deliverer.get_cookie_headers = Mock(return_value=True)
         deliverer._human_navigate_interlude = Mock()
 
-        with patch("auto_deliver.SpiderConfig", {"start_url": "https://example.invalid/search"}), \
+        with patch.dict("auto_deliver.SpiderConfig", {"start_url": "https://example.invalid/search"}), \
                 patch("auto_deliver.time.sleep"):
             deliverer._human_browse_after_delivery()
 

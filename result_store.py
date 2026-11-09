@@ -14,6 +14,29 @@ from prefilter import _format_jd_requirements
 class ResultRecorder:
     """结果行构造与 CSV 落盘混入（AutoDeliverer 继承使用）。"""
 
+    @staticmethod
+    def _load_processed_job_ids(path, *, dry_run):
+        """历史已完成结果参与跨轮去重；失败记录可重试，干跑仍可转正式投递。"""
+        completed = {
+            "delivered", "already_contacted", "below_threshold", "out_of_scope",
+            "prefilter_reject", "role_reject", "role_rejected", "condition_rejected",
+            "area_rejected", "hard_rejected", "local_gate_rejected",
+        }
+        if dry_run:
+            completed.update({"dry_run", "dry_run_ready"})
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                return {
+                    job_id
+                    for row in csv.DictReader(f)
+                    if (job_id := str(row.get("encryptJobId") or "").strip())
+                    and str(row.get("投递状态") or "").strip().lower() in completed
+                }
+        except FileNotFoundError:
+            return set()
+        except (OSError, UnicodeError, csv.Error) as exc:
+            raise OSError(f"历史结果无法读取，已停止任务以避免重复处理: {path}") from exc
+
     # ---------- 结果落盘（增量写入，随时中断不丢已评结果） ----------
     def _record(self, row: dict):
         """记一条结果并立刻落盘。"""

@@ -38,7 +38,7 @@ class CandidateProfilePageMixin:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout(toolbar)
@@ -48,6 +48,7 @@ class CandidateProfilePageMixin:
         toolbar_layout.addWidget(self.profile_view_status)
         toolbar_layout.addStretch(1)
         refresh = QPushButton("刷新")
+        refresh.setObjectName("soft")
         refresh.setToolTip("重新读取当前简历解析结果和已确认画像")
         refresh.setCursor(Qt.PointingHandCursor)
         refresh.clicked.connect(self._refresh_candidate_profile_view)
@@ -58,10 +59,10 @@ class CandidateProfilePageMixin:
         panels.setChildrenCollapsible(False)
         panels.setHandleWidth(14)
         self.profile_resume_view, self.profile_resume_view_layout = self._profile_view_panel(
-            "基础画像 · 简历解析"
+            "基础画像 · 简历解析", "由当前简历逐字提取，无需人工确认。"
         )
         self.profile_enhanced_view, self.profile_enhanced_view_layout = self._profile_view_panel(
-            "增强画像 · 访谈确认"
+            "增强画像 · 访谈确认", "完成访谈并确认后才生效，可随时重新访谈。"
         )
         panels.addWidget(self.profile_resume_view)
         panels.addWidget(self.profile_enhanced_view)
@@ -70,7 +71,7 @@ class CandidateProfilePageMixin:
         self._refresh_candidate_profile_view()
         return page
 
-    def _profile_view_panel(self, title):
+    def _profile_view_panel(self, title, subtitle=""):
         """左右两栏各包一张卡片：标题栏 + 可滚动内容区。"""
         card = QFrame()
         card.setObjectName("card")
@@ -80,9 +81,20 @@ class CandidateProfilePageMixin:
 
         head = QWidget()
         head_layout = QHBoxLayout(head)
-        head_layout.setContentsMargins(20, 14, 20, 14)
-        head_layout.addWidget(self._label(title, "section"))
-        head_layout.addStretch(1)
+        head_layout.setContentsMargins(20, 15, 20, 15)
+        head_layout.setSpacing(10)
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(3)
+        title_label = QLabel(title)
+        title_label.setObjectName("section")
+        titles.addWidget(title_label)
+        if subtitle:
+            subtitle_label = QLabel(subtitle)
+            subtitle_label.setObjectName("sectionHint")
+            subtitle_label.setWordWrap(True)
+            titles.addWidget(subtitle_label)
+        head_layout.addLayout(titles, 1)
         outer.addWidget(head)
         outer.addWidget(self._divider("divider"))
 
@@ -91,8 +103,8 @@ class CandidateProfilePageMixin:
         scroll.setFrameShape(QFrame.NoFrame)
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(18, 14, 12, 14)
-        body_layout.setSpacing(10)
+        body_layout.setContentsMargins(20, 16, 14, 16)
+        body_layout.setSpacing(12)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
         return card, body_layout
@@ -296,7 +308,7 @@ class CandidateProfilePageMixin:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout(toolbar)
@@ -304,12 +316,14 @@ class CandidateProfilePageMixin:
         toolbar_layout.setSpacing(8)
         self.profile_start_button = QPushButton("从简历开始访谈")
         self.profile_start_button.setObjectName("primary")
+        self.profile_start_button.setCursor(Qt.PointingHandCursor)
         self.profile_start_button.clicked.connect(self._start_profile_interview)
         toolbar_layout.addWidget(self.profile_start_button)
 
         self.profile_cancel_button = QPushButton("取消访谈")
         self.profile_cancel_button.setObjectName("danger")
         self.profile_cancel_button.setEnabled(False)
+        self.profile_cancel_button.setCursor(Qt.PointingHandCursor)
         self.profile_cancel_button.clicked.connect(self._cancel_profile_interview)
         toolbar_layout.addWidget(self.profile_cancel_button)
         toolbar_layout.addStretch(1)
@@ -321,7 +335,7 @@ class CandidateProfilePageMixin:
 
         workspace = QSplitter(Qt.Horizontal)
         workspace.setChildrenCollapsible(False)
-        workspace.setHandleWidth(12)
+        workspace.setHandleWidth(14)
         workspace.addWidget(self._build_chat_card())
         workspace.addWidget(self._build_review_card())
         workspace.setSizes([640, 520])
@@ -332,14 +346,22 @@ class CandidateProfilePageMixin:
         return page
 
     def _build_chat_card(self) -> QFrame:
-        card, card_layout = self._card((16, 14, 16, 16), 10)
+        card, card_layout = self._card((20, 16, 20, 18), 12)
 
         head = QWidget()
         head_layout = QHBoxLayout(head)
         head_layout.setContentsMargins(0, 0, 0, 0)
-        head_layout.addWidget(self._label("画像访谈", "section"))
-        head_layout.addStretch(1)
-        head_layout.addWidget(self._label("问答仅用于形成待确认草稿", "muted"))
+        head_layout.setSpacing(10)
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(3)
+        title_label = QLabel("画像访谈")
+        title_label.setObjectName("section")
+        titles.addWidget(title_label)
+        hint = QLabel("问答仅用于形成待确认草稿")
+        hint.setObjectName("sectionHint")
+        titles.addWidget(hint)
+        head_layout.addLayout(titles, 1)
         card_layout.addWidget(head)
 
         self.profile_transcript = QScrollArea()
@@ -349,7 +371,7 @@ class CandidateProfilePageMixin:
         inner = QWidget()
         inner.setObjectName("chatInner")
         self.profile_messages_layout = QVBoxLayout(inner)
-        self.profile_messages_layout.setContentsMargins(4, 4, 4, 4)
+        self.profile_messages_layout.setContentsMargins(14, 12, 14, 12)
         self.profile_messages_layout.setSpacing(0)
         self.profile_messages_layout.addStretch(1)
         self.profile_transcript.setWidget(inner)
@@ -358,7 +380,7 @@ class CandidateProfilePageMixin:
         self.profile_error_frame = QFrame()
         self.profile_error_frame.setObjectName("errorBanner")
         error_layout = QHBoxLayout(self.profile_error_frame)
-        error_layout.setContentsMargins(12, 8, 12, 8)
+        error_layout.setContentsMargins(14, 10, 14, 10)
         error_layout.setSpacing(10)
         self.profile_error_label = QLabel("")
         self.profile_error_label.setObjectName("errorText")
@@ -374,13 +396,13 @@ class CandidateProfilePageMixin:
         composer = QFrame()
         composer.setObjectName("composer")
         composer_layout = QHBoxLayout(composer)
-        composer_layout.setContentsMargins(10, 8, 10, 8)
+        composer_layout.setContentsMargins(12, 10, 12, 10)
         composer_layout.setSpacing(10)
 
         self.profile_answer = QPlainTextEdit()
         self.profile_answer.setPlaceholderText("在这里回答画像助手的问题…（Ctrl+Enter 发送）")
-        self.profile_answer.setMinimumHeight(74)
-        self.profile_answer.setMaximumHeight(120)
+        self.profile_answer.setMinimumHeight(78)
+        self.profile_answer.setMaximumHeight(130)
         self.profile_answer.setEnabled(False)
         composer_layout.addWidget(self.profile_answer, 1)
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.profile_answer)
@@ -403,17 +425,22 @@ class CandidateProfilePageMixin:
         return card
 
     def _build_review_card(self) -> QFrame:
-        card, card_layout = self._card((18, 16, 18, 16), 10)
+        card, card_layout = self._card((20, 16, 20, 18), 12)
 
         head = QWidget()
         head_layout = QHBoxLayout(head)
         head_layout.setContentsMargins(0, 0, 0, 0)
         head_layout.setSpacing(8)
-        head_layout.addWidget(self._label("画像草稿", "section"))
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(3)
+        title_label = QLabel("画像草稿")
+        title_label.setObjectName("section")
+        titles.addWidget(title_label)
         self.profile_draft_status = QLabel("尚未开始")
         self.profile_draft_status.setObjectName("statusChipIdle")
-        head_layout.addWidget(self.profile_draft_status)
-        head_layout.addStretch(1)
+        titles.addWidget(self.profile_draft_status)
+        head_layout.addLayout(titles, 1)
         self.profile_confirm_button = QPushButton("确认并保存")
         self.profile_confirm_button.setObjectName("primary")
         self.profile_confirm_button.setEnabled(False)
@@ -444,33 +471,33 @@ class CandidateProfilePageMixin:
         self.profile_draft_scroll.setFrameShape(QFrame.NoFrame)
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 2, 6, 2)
+        content_layout.setContentsMargins(0, 4, 8, 4)
         content_layout.setSpacing(16)
 
-        content_layout.addWidget(self._label("职业方向", "fieldLabel"))
+        content_layout.addWidget(self._label("职业方向", "fieldTitle"))
         self.profile_direction_edit = QLineEdit()
         self.profile_direction_edit.setPlaceholderText("访谈确认后填入，可在此微调")
         content_layout.addWidget(self.profile_direction_edit)
-        content_layout.addWidget(self._label("职位族", "fieldLabel"))
+        content_layout.addWidget(self._label("职位族", "fieldTitle"))
         content_layout.addWidget(self._chip_host("profile_families_layout"))
-        content_layout.addWidget(self._label("排除范围", "fieldLabel"))
+        content_layout.addWidget(self._label("排除范围", "fieldTitle"))
         content_layout.addWidget(self._chip_host("profile_excluded_layout"))
 
-        content_layout.addWidget(self._label("已确认能力与依据", "fieldLabel"))
+        content_layout.addWidget(self._label("已确认能力与依据", "fieldTitle"))
         evidence_host = QWidget()
         self.profile_evidence_layout = QVBoxLayout(evidence_host)
         self.profile_evidence_layout.setContentsMargins(0, 0, 0, 0)
         self.profile_evidence_layout.setSpacing(8)
         content_layout.addWidget(evidence_host)
 
-        content_layout.addWidget(self._label("待核实能力与信息", "fieldLabel"))
+        content_layout.addWidget(self._label("待核实能力与信息", "fieldTitle"))
         pending_host = QWidget()
         self.profile_pending_layout = QVBoxLayout(pending_host)
         self.profile_pending_layout.setContentsMargins(0, 0, 0, 0)
         self.profile_pending_layout.setSpacing(8)
         content_layout.addWidget(pending_host)
 
-        content_layout.addWidget(self._label("偏好", "fieldLabel"))
+        content_layout.addWidget(self._label("偏好", "fieldTitle"))
         content_layout.addWidget(self._chip_host("profile_preferences_layout"))
         content_layout.addStretch(1)
 

@@ -16,7 +16,6 @@ INT_LIMITS = {
     "JOB_DELAY_MIN": (0, 3600),
     "JOB_DELAY_MAX": (0, 3600),
     "HUMAN_EVERY_N": (0, 1000),
-    "FAVORITE_SCORE": (0, 100),
     "DETAIL_DELAY_MIN": (0, 600),
     "DETAIL_DELAY_MAX": (0, 600),
     "TEST_LIMIT": (0, 99999),
@@ -32,7 +31,7 @@ CONFIG_WARNINGS = {
         "true": "干跑模式：只采集与评分，不会真实投递。",
     },
     "HUMANIZE_ENABLE": {
-        "false": "已关闭拟人浏览：心跳只做登录态恢复，行为特征更少。",
+        "false": "已关闭额外浏览动作，仍会同步登录信息。",
     },
 }
 
@@ -71,8 +70,11 @@ def validate_config_values(values: dict, resume_exists=True) -> list:
             errors.append(f"「{env_key}」不是支持的平台筛选值：{raw}")
     industry = str(values.get("PLATFORM_INDUSTRY", "") or "").strip()
     if industry and not resolve_platform_filter("PLATFORM_INDUSTRY", industry):
-        errors.append("「平台行业 ID」需要是数字 ID（例如 100020），留空表示不限")
-    for key, label in (("WORK_TIME_START", "最早上班时间"), ("WORK_TIME_END", "最晚下班时间")):
+        errors.append("「平台行业 ID」需要是数字 ID（多个用逗号分隔），或包含 industry 参数的 BOSS 搜索链接")
+    for key, label in (
+        ("WORK_TIME_START", "最早可接受上班时间"),
+        ("WORK_TIME_END", "最晚下班时间"),
+    ):
         value = str(values.get(key, "") or "").strip()
         if value and parse_hhmm(value) is None:
             errors.append(f"「{label}」需要是 hh:mm 格式（如 09:30），当前：{value}")
@@ -80,7 +82,7 @@ def validate_config_values(values: dict, resume_exists=True) -> list:
     start = parse_hhmm(str(values.get("WORK_TIME_START", "") or ""))
     end = parse_hhmm(str(values.get("WORK_TIME_END", "") or ""))
     if start is not None and end is not None and start >= end:
-        errors.append("「最早上班时间」需要早于「最晚下班时间」")
+        errors.append("「最早可接受上班时间」需要早于「最晚下班时间」")
 
     for key, (low, high) in INT_LIMITS.items():
         raw = str(values.get(key, "") or "").strip()

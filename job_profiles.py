@@ -10,11 +10,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app_paths import get_data_dir, get_resource_dir
 from candidate_profiles import CandidateProfile
 
 
-DEFAULT_JOB_PROFILES_PATH = Path(__file__).with_name("job_profiles.json")
-DEFAULT_SCREENING_RULES_PATH = Path(__file__).with_name("screening_rules.md")
+DEFAULT_JOB_PROFILES_PATH = get_data_dir() / "job_profiles.json"
+DEFAULT_SCREENING_RULES_PATH = get_resource_dir() / "screening_rules.md"
 
 
 def _clean_required(value: str) -> str:

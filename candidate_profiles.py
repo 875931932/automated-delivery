@@ -13,10 +13,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app_paths import get_data_dir
 
-DEFAULT_PROFILE_PATH = Path(__file__).with_name("candidate_profile.json")
-DEFAULT_DIGEST_PATH = Path(__file__).with_name("resume_digest.json")
-DEFAULT_DRAFT_CACHE_PATH = Path(__file__).with_name("interview_draft_cache.json")
+DEFAULT_PROFILE_PATH = get_data_dir() / "candidate_profile.json"
+DEFAULT_DIGEST_PATH = get_data_dir() / "resume_digest.json"
+DEFAULT_DRAFT_CACHE_PATH = get_data_dir() / "interview_draft_cache.json"
 
 
 def resume_digest_hash(resume: str) -> str:

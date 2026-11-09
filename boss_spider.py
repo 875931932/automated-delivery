@@ -1,4 +1,9 @@
+from process_runtime import configure_quiet_processes, quiet_process_options
+
+configure_quiet_processes()
+
 from DrissionPage import ChromiumPage,ChromiumOptions
+from browser_runtime import resolve_browser_path
 from get_user_agent import get_user_agent_of_pc
 import time
 import random
@@ -10,7 +15,7 @@ import html
 from typing import Optional, Dict# 移除前（误匹配）
 import os
 import csv
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from platform_locations import resolve_platform_area_codes
 from platform_search_filters import JOB_TYPE_CODES, PLATFORM_FILTER_PARAMS
 
@@ -31,7 +36,8 @@ Config = {
     "max_pages": 10,  # 单次最多 10 页（300 条），上限保护，降低被封风险
     "request_timeout": 15,
     "max_retries": 2,
-    "heart_time": 15,
+    "heart_time": 60,
+    "human_browse_cooldown": 60,
     "job_delay": (1.5, 3),
     "page_delay": (12, 22),  # 翻页间隔 12-22 秒随机延迟，模拟真人浏览节奏
     "retry_delay": 4,
@@ -42,6 +48,7 @@ Config = {
     "chrome_profile_dir": os.path.join(os.path.expanduser("~"), ".boss-zhipin-scraper", "chrome-profile"),
     # 登录态保持：true=固定UA+持久profile(重启免登录)；false=随机UA+临时profile(每次需登录)
     "keep_login": True,
+    "browser_background": True,
 }
 
 # 干净的 Chrome UA 候选（登录态要求 UA 稳定，首次随机后持久化复用）
@@ -112,17 +119,20 @@ class BossDP:
         return ua
 
     @staticmethod
-    def _kill_stale_chrome(profile_dir):
-        """清理仍占用本程序专用 profile 的残留 Chrome（上次异常退出/面板强杀后常见）。
+    def _kill_stale_chrome(profile_dir, browser_path=None):
+        """清理仍占用本程序专用 profile 的残留 Chromium 进程。
         同一个 --user-data-dir 只允许一个实例：残留进程会让新启动的 Chrome 直接转发 URL 后退出，
-        结果 DrissionPage 连不上新端口、页面始终不跳转。
-        只匹配「含本 profile 路径且带调试端口」的进程，不影响用户日常 Chrome。"""
+        结果 DrissionPage 连不上新端口、页面始终不跳转。"""
         import subprocess
         try:
             env = os.environ.copy()
             env['BOSS_PROFILE'] = profile_dir
+            env['BOSS_BROWSER_PROCESS'] = (
+                os.path.basename(browser_path) if browser_path else "chrome.exe"
+            )
             ps = (
-                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -ieq $env:BOSS_BROWSER_PROCESS } | "
                 "Where-Object { $_.CommandLine -like \"*$env:BOSS_PROFILE*\" "
                 "-and $_.CommandLine -like '*--remote-debugging-port*' } | "
                 "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
@@ -131,10 +141,11 @@ class BossDP:
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
                 env=env, capture_output=True, text=True, timeout=20,
+                **quiet_process_options(),
             )
             killed = [x.strip() for x in (result.stdout or '').splitlines() if x.strip()]
             if killed:
-                print(f"[浏览器] 清理残留 Chrome 进程: {', '.join(killed)}")
+                print(f"[浏览器] 清理残留浏览器进程: {', '.join(killed)}")
                 time.sleep(1.5)
         except Exception as exc:
             print(f"[浏览器] 清理残留进程失败（可忽略）: {exc}")
@@ -143,11 +154,16 @@ class BossDP:
         self.urgent_event=threading.Event()#设置紧急心跳信号
         self.stop_event = threading.Event()
         self.browser_lock=threading.RLock()#心跳线程和主线程共用浏览器
+        self._session_lock = threading.RLock()  # requests.Session 与 cookie 同步锁
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_thread = None
+        self._last_human_browse_at = None
         self.click_job_count = 0  # 点击职位计数
         self.enter_detail_count = 0  # 进入详细页面计数
         # 登录态保持开关：开启时 UA 固定 + 持久 profile；关闭时随机 UA（更隐蔽但需重新登录）
         self.keep_login = Config.get("keep_login", True)
         if self.keep_login:
+            os.makedirs(Config["chrome_profile_dir"], exist_ok=True)
             self.user_agent = self._stable_user_agent(Config["chrome_profile_dir"])
         else:
             self.user_agent = get_user_agent_of_pc()
@@ -160,27 +176,57 @@ class BossDP:
             os.makedirs(profile_dir, exist_ok=True)
             print(f"使用 BOSS 专用 Chrome profile: {profile_dir}")
 
+        self.browser_path = resolve_browser_path()
+        print(f"[浏览器] 使用 Chromium: {self.browser_path}")
+        self.browser_background = Config.get("browser_background", True)
+        self._background_unavailable = False
+        self._browser_profile_dir = profile_dir
+        self._browser_attention_url = None
+        self._login_waiting = False
+        if profile_dir:
+            self._kill_stale_chrome(profile_dir, self.browser_path)
+        self.page = self._open_browser(self.browser_background)
+        # Keep even a temporary profile across interactive login mode switches.
+        self._browser_profile_dir = self.page.browser.user_data_path
+        self._browser_headless = self.browser_background
+        #初始化requests
+        self.session=requests.Session()
+        self.current_cookies={}
+        self.current_headers={}
+        #存储数据
+        self.all_jobs=[]
+        self.seen_job_ids=set()
+        self.detail_company_cache = {}
+        self.stats={
+            'page':0,
+            "jobs_fetched":0,
+            "details_success":0
+        }
+
+    def _open_browser(self, headless):
         co=ChromiumOptions()
-        co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        co.set_browser_path(str(self.browser_path))
         co.set_local_port(self._pick_free_port())  # 随机空闲端口，替代 auto_port（见 _pick_free_port 注释）
         co.set_argument('--disable-blink-features=AutomationControlled')
         co.set_argument('--no-sandbox')#初始化了浏览器模拟浏览器指纹
         co.set_user_agent(self.user_agent)
         co.set_argument('--window-size','1920,1080')
+        co.headless(headless)
+        co.set_argument('--no-first-run')
+        co.set_argument('--no-default-browser-check')
         # 窗口被用户最小化后，后台标签仍要正常加载，不被 Chrome 节流冻结
         co.set_argument('--disable-background-timer-throttling')
         co.set_argument('--disable-backgrounding-occluded-windows')
         co.set_argument('--disable-renderer-backgrounding')
 
         # 使用独立 profile，避免污染主 Chrome（必须用官方 API，set_argument 会与内部默认值冲突）
-        if profile_dir:
-            self._kill_stale_chrome(profile_dir)  # 先清理残留实例，否则新窗口不会跳转
-            co.set_user_data_path(profile_dir)
+        if self._browser_profile_dir:
+            co.set_user_data_path(self._browser_profile_dir)
             # 使用 Default profile，确保登录态持久化
             co.set_argument('--profile-directory=Default')
         
-        self.page=ChromiumPage(co)
-        self.page.run_cdp('Page.addScriptToEvaluateOnNewDocument', source='''
+        page = ChromiumPage(co)
+        page.run_cdp('Page.addScriptToEvaluateOnNewDocument', source='''
                 // 1. 伪造内存大小 (解决 CHR_MEMORY FAIL)
                 Object.defineProperty(navigator, 'deviceMemory', {
                     value: 8, 
@@ -198,51 +244,122 @@ class BossDP:
                 });
             '''
         )
-        #初始化requests
-        self.session=requests.Session()
-        self.current_cookies={}
-        self.current_headers={}
-        #存储数据
-        self.all_jobs=[]
-        self.seen_job_ids=set()
-        self.detail_company_cache = {}
-        self.stats={
-            'page':0,
-            "jobs_fetched":0,
-            "details_success":0
-        }
+        return page
+
+    def _switch_browser_mode(self, headless, url=None):
+        """Called only by the main flow, between page operations."""
+        with self.browser_lock:
+            if self._browser_headless == headless:
+                return False
+            # Session cookies need an in-memory transfer in addition to the profile.
+            cookies = self.page.run_cdp('Storage.getCookies', _timeout=3)['cookies']
+            target_url = url or self.page.url
+            self.page.quit(timeout=5)
+            self._detail_tab = None
+            self.page = self._open_browser(headless)
+            self._browser_headless = headless
+            self.page.browser.set.cookies(cookies)
+            self.page.get(target_url)
+            print("[浏览器] 已切换为后台运行" if headless else
+                  "[浏览器] 请在打开的窗口中完成登录或验证")
+            return True
+
+    @staticmethod
+    def _is_browser_attention_url(url):
+        if not isinstance(url, str):
+            return False
+        parsed = urlparse(url)
+        return (parsed.netloc == urlparse(Config['base_url']).netloc
+                and parsed.path.startswith(('/web/user/', '/web/common/security')))
+
+    def _wait_for_login(self, timeout, start_url=None):
+        """Check the rendered avatar, and show an interactive browser only if needed."""
+        start_url = start_url or Config['start_url']
+        started = time.monotonic()
+        background_retry = self.browser_background and not getattr(self, '_background_unavailable', False)
+        mode_started = started
+        self._login_waiting = True
+        try:
+            with self.browser_lock:
+                self.page.get(start_url)
+            print("正在检查登录信息；需要扫码时会显示浏览器...")
+            last_report = 0
+            while not self.stop_event.is_set():
+                time.sleep(3)
+                with self.browser_lock:
+                    logged_in = bool(self.page.ele('.nav-figure', timeout=2))
+                    elapsed = time.monotonic() - started
+                    if logged_in:
+                        if background_retry and not self._browser_headless:
+                            self._switch_browser_mode(True, url=Config['start_url'])
+                            # Revalidate the session after restarting; never assume cookies suffice.
+                            background_retry = False
+                            mode_started = time.monotonic()
+                            continue
+                        self._browser_attention_url = None
+                        print(f"检测到登录成功（用时 {int(elapsed)} 秒）")
+                        return
+                    if timeout > 0 and elapsed >= timeout:
+                        raise TimeoutError(f"等待登录超过 {timeout} 秒，请完成登录后重新启动任务")
+                    if self._browser_headless and time.monotonic() - mode_started >= 6:
+                        if not background_retry:
+                            self._background_unavailable = True
+                            print("[浏览器] 后台登录检查未通过，本轮保留可见窗口")
+                        self._switch_browser_mode(False)
+                    # Do not reload while the user is scanning the QR code.
+                if elapsed - last_report >= 30:
+                    print(f"  仍在等待登录... 已等待 {int(elapsed)} 秒")
+                    last_report = elapsed
+            raise InterruptedError("任务已停止，取消登录等待")
+        finally:
+            self._login_waiting = False
+
+    def _resume_browser_if_needed(self):
+        """Consume heartbeat's signal on the main thread, never inside an HTTP request."""
+        url = getattr(self, '_browser_attention_url', None)
+        if url:
+            timeout = getattr(self, 'cfg', {}).get('login_wait', 300)
+            self._wait_for_login(timeout, start_url=url)
+            self.get_cookie_headers()
+
+    def _check_browser_attention(self, page):
+        if self._is_browser_attention_url(page.url):
+            self._browser_attention_url = page.url
+            self._resume_browser_if_needed()
+            return True
+        return False
+
     def login(self):
-        #登陆账号，准备获取cookies
-        self.page.get(Config['start_url'])
-        print("准备登陆")
-        input("登陆完成后回车继续任务")
+        self._wait_for_login(0)
         #同步初始cookies和headers
         self.get_cookie_headers()
         
     def get_cookie_headers(self):
         try:
-            with self.browser_lock:
-                cookies_list = self.page.cookies()
-            # 将列表转换为字典
-            cookies_dict = {}
-            for cookie in cookies_list:
-                if 'name' in cookie and 'value' in cookie:
-                    cookies_dict[cookie['name']] = cookie['value']
-            self.session.cookies.clear()
-            for k, v in cookies_dict.items():
-                self.session.cookies.set(k, v)
-            self.current_cookies = cookies_dict
-            self.session.cookies.update(cookies_dict)
-            self.current_headers={
-                "User-Agent": self.user_agent,
-                'Accept': 'application/json, text/plain, */*',
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'origin': 'https://www.zhipin.com',
-                'referer': Config["start_url"],
-                'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,en-GB;q=0.6',
-                'priority': 'u=1, i',
-            }
-            self.session.headers.update(self.current_headers)
+            # Keep one lock order: browser, then session. Direct CDP avoids the
+            # unbounded document-load wait used by page.cookies().
+            with self.browser_lock, self._session_lock:
+                cookies_list = self.page.run_cdp(
+                    'Network.getCookies', _timeout=2,
+                )['cookies']
+                cookies_dict = {
+                    cookie['name']: cookie['value']
+                    for cookie in cookies_list
+                    if 'name' in cookie and 'value' in cookie
+                }
+                self.session.cookies.clear()
+                self.session.cookies.update(cookies_dict)
+                self.current_cookies = cookies_dict
+                self.current_headers={
+                    "User-Agent": self.user_agent,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'origin': 'https://www.zhipin.com',
+                    'referer': Config["start_url"],
+                    'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,en-GB;q=0.6',
+                    'priority': 'u=1, i',
+                }
+                self.session.headers.update(self.current_headers)
             return True
         except Exception as e:
             print("同步cookies失败",e)
@@ -251,330 +368,109 @@ class BossDP:
         """已迁移到 _human_click_job_action，此方法保留为空兼容旧调用"""
         pass
 
-    # ================= 心跳线程（定期模拟操作保活） =================
-    def start_heartbeat(self):
-        """后台线程：定期执行拟人操作，维持 cookies 有效"""
-        def heartbeat_task():
-            print(f"[心跳线程] 启动，每 {Config['heart_time']} 秒执行一次拟人操作\n")
-            time.sleep(5)
-
-            while not self.stop_event.is_set():
-                is_urgent = self.urgent_event.wait(timeout=Config['heart_time'])
-                if is_urgent:
-                    print(f"【心跳】收到紧急信号，立刻执行")
-                    self.urgent_event.clear()
-                try:
-                    # 尝试获取浏览器锁，最多等5秒，超时就跳过本轮不阻塞主流程
-                    if not self.browser_lock.acquire(timeout=5):
-                        print(f" [心跳] 浏览器正忙，跳过本轮")
-                        continue
-                    try:
-                        current_url = self.page.url
-                        is_homepage = current_url == "https://www.zhipin.com/"
-                        if is_homepage:
-                            print(f" [心跳] 检测到跳转到首页，重新加载列表页...")
-                            self.page.get(Config['start_url'])
-                            time.sleep(3)
-                            self.get_cookie_headers()
-                            continue
-
-                        # 拟人行为可选：关闭时只保留"首页恢复"这一保底功能
-                        if not getattr(self, 'humanize_enabled', True):
-                            continue
-
-                        # 随机选择一种拟人行为（轻量为主，效率优先）
-                        action_type = random.choices(
-                            ['quick_scan', 'hesitate_click', 'deep_read',
-                             'compare_jobs', 'filter_check', 'favorite_job'],
-                            weights=[32, 28, 15, 10, 5, 10],
-                            k=1
-                        )[0]
-
-                        start_time = time.time()
-                        if action_type == 'quick_scan':
-                            self._human_quick_scan()
-                        elif action_type == 'hesitate_click':
-                            self._human_hesitate_click()
-                        elif action_type == 'deep_read':
-                            self._human_deep_read()
-                        elif action_type == 'compare_jobs':
-                            self._human_compare_jobs()
-                        elif action_type == 'filter_check':
-                            self._human_filter_check()
-                        elif action_type == 'favorite_job':
-                            self._human_favorite_job()
-
-                        elapsed = time.time() - start_time
-                        if elapsed > 20:
-                            print(f" [心跳] ⚠️ 心跳行为超时 ({elapsed:.1f}s)，强制跳过本轮")
-                            try:
-                                self.page.get(Config['start_url'])
-                                time.sleep(2)
-                                self.get_cookie_headers()
-                            except Exception:
-                                pass
-                    finally:
-                        self.browser_lock.release()
-
-                except Exception as e:
-                    print(f" 心跳线程异常: {e}")
-                    try:
-                        self.browser_lock.release()
-                    except Exception:
-                        pass
-        thread = threading.Thread(target=heartbeat_task, daemon=True)
-        thread.start()
-
-    # ================= 拟人操作 =================
-    def _human_quick_scan(self):
-        """快速扫描列表页：快速滚几屏，什么都不点（模拟快速筛选，占比30%）"""
-        print(" [心跳] 快速扫描列表")
-        # 先快速向上滚到顶部（模拟刚回来从新看）
-        self.page.scroll.to_top()
-        time.sleep(random.uniform(0.3, 0.8))
-
-        scan_count = random.randint(8, 15)
-        for i in range(scan_count):
-            # 偶尔向上回滚（模拟看到感兴趣的又回去看）
-            if random.random() < 0.15:
-                self.page.scroll.up(random.randint(30, 80))
-                time.sleep(random.uniform(0.2, 0.5))
-            else:
-                self.page.scroll.down(random.randint(25, 60))
-                time.sleep(random.uniform(0.15, 0.4))
-        time.sleep(random.uniform(1.0, 2.5))
-
-    def _human_hesitate_click(self):
-        """犹豫点击：看到感兴趣岗位，犹豫一会，点进去快速看，返回（占比25%）"""
-        print(" [心跳] 犹豫点击岗位")
-        job_list_ele = self.page.ele('.rec-job-list', timeout=5)
-        if not job_list_ele:
-            return
-        jobs = job_list_ele.eles('.job-card-box', timeout=3)
-        if not jobs:
-            return
-
-        # 偏好前10个岗位（简历预览区域通常在前面的岗位最先吸引注意）
-        idx = random.randint(0, min(9, len(jobs) - 1))
-        target_job = jobs[idx]
-        job_name_ele = target_job.ele(".job-name", timeout=2)
-        job_name = job_name_ele.text if job_name_ele else f"岗位{idx+1}"
-
-        # 犹豫期：先滚动几次靠近目标，偶尔滚过头再回来
-        for _ in range(random.randint(2, 4)):
-            dist = random.randint(20, 60)
-            if random.random() < 0.3:
-                # 30%概率滚过头（模拟看走眼）
-                self.page.scroll.down(dist + random.randint(20, 40))
-                time.sleep(random.uniform(0.2, 0.5))
-                self.page.scroll.up(random.randint(20, 40))
-            else:
-                self.page.scroll.down(dist)
-            time.sleep(random.uniform(0.3, 0.8))
-        time.sleep(random.uniform(0.8, 2.0))  # 停顿犹豫
-
-        # 点击
-        print(f" [心跳] 点击: {job_name}")
-        target_job.click()
-        time.sleep(random.uniform(1.5, 3))
-
-        # 详情页快速浏览
-        for _ in range(random.randint(1, 3)):
-            self.page.scroll.down(random.randint(40, 100))
-            time.sleep(random.uniform(0.3, 0.8))
-        time.sleep(random.uniform(1.0, 3.0))
-        # 不做返回列表操作，模拟在列表页内查看详情（同页面切换）
-
-    def _human_deep_read(self):
-        """深度阅读：认真看一个岗位，来回滚动（权重15%，缩短版）"""
-        print(" [心跳] 深度阅读岗位")
-        job_list_ele = self.page.ele('.rec-job-list', timeout=5)
-        if not job_list_ele:
-            return
-        jobs = job_list_ele.eles('.job-card-box', timeout=3)
-        if not jobs:
-            return
-
-        idx = random.randint(0, min(7, len(jobs) - 1))
-        target_job = jobs[idx]
-        job_name_ele = target_job.ele(".job-name", timeout=2)
-        job_name = job_name_ele.text if job_name_ele else f"岗位{idx+1}"
-
+    @staticmethod
+    def _is_platform_homepage(url):
+        """只识别平台根首页，避免把详情页或聊天页误判成首页。"""
         try:
-            job_id = target_job.ele('tag:a', timeout=2).link
-            if job_id:
-                job_id = job_id.split('/')[-1].replace('.html', '')
-        except:
-            job_id = None
+            parsed = urlparse(str(url or ''))
+            return (
+                parsed.scheme in {'http', 'https'}
+                and parsed.netloc == urlparse(Config['base_url']).netloc
+                and parsed.path.rstrip('/') == ''
+            )
+        except ValueError:
+            return False
 
-        if not job_id:
-            return
-
-        print(f" [心跳] 深度阅读: {job_name}")
-        detail_url = f"https://www.zhipin.com/job_detail/{job_id}.html"
-        self.page.get(detail_url)
-        time.sleep(random.uniform(2, 4))
-
-        # 来回滚动阅读（缩短：2-4轮，5秒内完成）
-        scroll_rounds = random.randint(2, 4)
-        for r in range(scroll_rounds):
-            for _ in range(random.randint(1, 3)):
-                self.page.scroll.down(random.randint(60, 120))
-                time.sleep(random.uniform(0.3, 0.8))
-            time.sleep(random.uniform(0.3, 1.0))
-            for _ in range(random.randint(1, 2)):
-                self.page.scroll.up(random.randint(50, 100))
-                time.sleep(random.uniform(0.2, 0.6))
-
-        time.sleep(random.uniform(2, 5))  # 阅读停留
-
-        # 深度阅读时"感兴趣"：AI相关岗位有概率收藏
-        if self._is_ai_related(job_name) and random.random() < 0.1:
-            try:
-                fav_btn = self.page.ele('.op-btn.op-btn-like', timeout=3)
-                if fav_btn and '已收藏' not in fav_btn.text:
-                    fav_btn.click()
-                    print(f" [心跳-感兴趣] 收藏: {job_name}")
-                    time.sleep(random.uniform(1, 2))
-            except Exception:
-                pass
-
-        print(" [心跳] 返回列表")
-        self.page.get(Config['start_url'])
-        time.sleep(random.uniform(2, 4))
-        self.get_cookie_headers()
-
-    def _human_compare_jobs(self):
-        """对比操作：随机看1-2个岗位（权重12%，缩短版）"""
-        print(" [心跳] 对比岗位")
-        job_list_ele = self.page.ele('.rec-job-list', timeout=5)
-        if not job_list_ele:
-            return
-        jobs = job_list_ele.eles('.job-card-box', timeout=3)
-        if not jobs or len(jobs) < 2:
-            return
-
-        # 随机看 1-2 个岗位
-        job_list_data = jobs[:min(8, len(jobs))]
-        compare_count = random.randint(1, min(2, len(job_list_data)))
-        selected = random.sample(job_list_data, compare_count)
-
-        for i, job in enumerate(selected, 1):
-            job_name_ele = job.ele(".job-name", timeout=2)
-            job_name = job_name_ele.text if job_name_ele else f"岗位{i}"
-            print(f" [心跳] 查看对比: {job_name}")
-            job.click()
-            time.sleep(random.uniform(1.5, 3))
-            for _ in range(random.randint(1, 3)):
-                self.page.scroll.down(random.randint(40, 100))
-                time.sleep(random.uniform(0.3, 0.8))
-            time.sleep(random.uniform(1.0, 2.5))
-            self.page.get(Config['start_url'])
-            time.sleep(random.uniform(1.5, 3))
-            self.get_cookie_headers()
-
-    def _human_filter_check(self):
-        """切换筛选条件（占比10%）：模拟用户调整筛选器"""
-        print(" [心跳] 检查筛选条件")
-        # 偶尔切换一下工作性质筛选（实习/全职切换）
+    @staticmethod
+    def _is_search_page(url):
         try:
-            job_type_ele = self.page.ele('text:工作性质', timeout=3)
-            if job_type_ele:
-                parent = job_type_ele.parent()
-                # 点击展开/收起筛选
-                parent.click()
-                time.sleep(random.uniform(1.0, 2.0))
-                # 可能点一个筛选选项
-                options = self.page.eles('.filter-checkbox', timeout=2)
-                if options:
-                    random.choice(options).click()
-                    time.sleep(random.uniform(1.0, 2.0))
-                # 关闭筛选面板
-                close_btn = self.page.ele('.btn-sure', timeout=2) or \
-                            self.page.ele('.filter-confirm', timeout=2)
-                if close_btn:
-                    close_btn.click()
-                    time.sleep(random.uniform(1.0, 2.0))
-        except:
-            pass
+            parsed = urlparse(str(url or ''))
+            return (
+                parsed.scheme in {'http', 'https'}
+                and parsed.netloc == urlparse(Config['base_url']).netloc
+                and parsed.path.rstrip('/') == '/web/geek/jobs'
+            )
+        except ValueError:
+            return False
 
-        self.get_cookie_headers()
-
-    def _human_favorite_job(self):
-        """随机收藏/取消收藏岗位（占比20%）：只收藏AI应用相关岗位"""
-        print(" [心跳-收藏] 随机收藏岗位操作")
+    # ================= 心跳线程（只做被动保活与页面恢复） =================
+    def _heartbeat_once(self):
+        if (self.stop_event.is_set() or getattr(self, '_login_waiting', False)
+                or not self.browser_lock.acquire(blocking=False)):
+            return
         try:
-            # 查找列表页的职位卡片
-            job_cards = self.page.eles('.job-card-box', timeout=5)
-            if not job_cards or len(job_cards) == 0:
-                print(" [心跳-收藏] 未找到岗位卡片")
+            # Never hold the browser hostage to an in-flight HTTP request.
+            if not self._session_lock.acquire(blocking=False):
                 return
-
-            # 随机选1-2个卡片
-            count = random.randint(1, min(2, len(job_cards)))
-            targets = random.sample(job_cards, count)
-
-            for card in targets:
-                # 获取岗位名称
-                name_ele = card.ele('.job-name', timeout=2)
-                job_name = name_ele.text if name_ele else "未知岗位"
-
-                # 判断是否为 AI 应用相关岗位
-                if not self._is_ai_related(job_name):
-                    print(f" [心跳-收藏] 跳过（非AI岗位）: {job_name}")
-                    continue
-
-                # 随机决定：收藏 还是 取消收藏
-                will_favorite = random.random() < 0.7  # 70%收藏，30%取消
-
-                card.click()
-                time.sleep(random.uniform(1.0, 2.0))
-
-                if will_favorite:
-                    # 点击收藏按钮
-                    fav_btn = self.page.ele('.op-btn.op-btn-like', timeout=3)
-                    if fav_btn and '已收藏' not in fav_btn.text:
-                        fav_btn.click()
-                        print(f" [心跳-收藏] 收藏: {job_name}")
-                        time.sleep(random.uniform(3, 6))  # 阅读一会儿
-                        # 取消收藏
-                        fav_btn = self.page.ele('.op-btn.op-btn-like', timeout=3)
-                        if fav_btn and '已收藏' in fav_btn.text:
-                            fav_btn.click()
-                            time.sleep(random.uniform(0.5, 1.0))
-                            print(f" [心跳-收藏] 取消收藏: {job_name}")
-                    else:
-                        print(f" [心跳-收藏] 已收藏或按钮不存在: {job_name}")
-                else:
-                    print(f" [心跳-收藏] 本次不操作: {job_name}")
-
-                # 返回列表
-                self.page.get(Config['start_url'])
-                time.sleep(random.uniform(2, 4))
-                self.get_cookie_headers()
-
-        except Exception as e:
-            print(f" [心跳-收藏] 异常: {e}")
             try:
-                self.page.get(Config['start_url'])
-                time.sleep(2)
-                self.get_cookie_headers()
-            except Exception:
-                pass
+                if self.stop_event.is_set():
+                    return
+                info = self.page.run_cdp('Target.getTargetInfo', _timeout=2)
+                current_url = info['targetInfo']['url']
+                parsed = urlparse(current_url)
+                if parsed.netloc != urlparse(Config['base_url']).netloc:
+                    return
+                if self._is_browser_attention_url(current_url):
+                    print(" [心跳] 当前为登录或验证页面，等待人工处理")
+                    self._browser_attention_url = current_url
+                    return
+                if self.stop_event.is_set():
+                    return
+                if self._is_platform_homepage(current_url):
+                    print(" [心跳] 检测到首页，恢复搜索列表")
+                    self.page.get(Config['start_url'], retry=0, timeout=5)
+                if not self.stop_event.is_set():
+                    self.get_cookie_headers()
+            finally:
+                self._session_lock.release()
+        except Exception as exc:
+            print(f" [心跳] 页面检查失败: {exc}")
+        finally:
+            self.browser_lock.release()
 
-    def _is_ai_related(self, job_name: str) -> bool:
-        """判断岗位是否为 AI 应用相关"""
-        ai_keywords = Config.get('ai_whitelist', [
-            'AI应用开发', '大模型应用', 'RAG', 'Agent开发', 'AI全栈',
-            'AI应用', '人工智能', '机器学习', '深度学习', '大模型',
-            'AIGC', 'AI工程师', 'AI开发', '智能体', 'NLPer',
-            'AI产品', 'NLP', 'LLM', '提示词工程', '多模态',
-            'AI Agent', 'AI应用工程师', '大模型应用开发',
-            'RAG开发', 'AI应用开发工程师', 'AI全栈开发工程师',
-            '大模型开发', 'AI研发', '机器学习工程师', '深度学习工程师',
-        ])
-        name_lower = job_name.lower()
-        return any(kw.lower() in name_lower for kw in ai_keywords)
+    def _heartbeat_loop(self):
+        interval = max(1, Config['heart_time'])
+        print(f"[心跳线程] 启动，每 {interval} 秒检查页面并同步登录信息\n")
+        while not self.stop_event.is_set():
+            self.urgent_event.wait(timeout=interval)
+            if self.stop_event.is_set():
+                break
+            self.urgent_event.clear()
+            self._heartbeat_once()
+
+    def start_heartbeat(self):
+        """启动唯一的后台心跳线程，不在后台线程执行随机拟人操作。"""
+        with self._heartbeat_lock:
+            if self.stop_event.is_set():
+                return None
+            existing = self._heartbeat_thread
+            if existing is not None and existing.is_alive():
+                return existing
+            thread = threading.Thread(
+                target=self._heartbeat_loop, name="boss-heartbeat", daemon=True,
+            )
+            self._heartbeat_thread = thread
+            thread.start()
+            return thread
+
+    def stop_heartbeat(self):
+        """停止心跳并等待其退出，确保页面关闭前没有后台浏览器调用。"""
+        stop_event = getattr(self, 'stop_event', None)
+        if stop_event is not None:
+            stop_event.set()
+        urgent_event = getattr(self, 'urgent_event', None)
+        if urgent_event is not None:
+            urgent_event.set()
+        lifecycle_lock = getattr(self, '_heartbeat_lock', None)
+        if lifecycle_lock is not None:
+            with lifecycle_lock:
+                thread = self._heartbeat_thread
+        else:
+            thread = getattr(self, '_heartbeat_thread', None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        if thread is not None and not thread.is_alive():
+            self._heartbeat_thread = None
 
     #通过api获取信息
     def api_job_list(self,page:int =1,keyword:str=Config['keyword'])->Optional[Dict]:
@@ -593,35 +489,38 @@ class BossDP:
                 data[key] = Config[key]
         return self._request_json("post", url, data=data, label="列表")
 
-    def _request_json(self, method: str, url: str, label: str, **kwargs):
+    def _request_json(
+        self, method: str, url: str, label: str,
+        request_headers=None, **kwargs,
+    ):
         """请求 JSON 接口，统一处理网络、HTTP、JSON 和业务错误。"""
-        # 检查 API 请求上限
-        if self.api_request_count >= self.max_api_requests:
-            print(f"⚠️ 已达到单次最大 API 请求数上限 ({self.max_api_requests})，停止请求")
-            return None
-        
+        self._resume_browser_if_needed()
         # 请求间随机延迟，模拟真人操作节奏
         delay = random.uniform(1.5, 4.0)
         time.sleep(delay)
         
         for attempt in range(Config["max_retries"]):
             try:
-                # 正常情况下复用当前登录态；只有首次请求或重试时重新同步。
+                # Read browser cookies before taking the session lock.
                 if not self.current_cookies and not self.get_cookie_headers():
                     raise requests.RequestException("登录态同步失败")
-                
-                # 增加请求计数
-                self.api_request_count += 1
-                current_count = self.api_request_count
-                
-                # 每 20 次请求打印一次计数，方便监控
-                if current_count % 20 == 0:
-                    print(f"  [API] 累计请求 {current_count} 次")
-                
-                response = self.session.request(
-                    method, url, headers=self.current_headers,
-                    timeout=Config["request_timeout"], **kwargs
-                )
+                with self._session_lock:
+                    if self.api_request_count >= self.max_api_requests:
+                        print(f"⚠️ 已达到单次最大 API 请求数上限 ({self.max_api_requests})，停止请求")
+                        return None
+                    # 增加请求计数
+                    self.api_request_count += 1
+                    current_count = self.api_request_count
+
+                    # 每 20 次请求打印一次计数，方便监控
+                    if current_count % 20 == 0:
+                        print(f"  [API] 累计请求 {current_count} 次")
+
+                    headers = {**self.current_headers, **(request_headers or {})}
+                    response = self.session.request(
+                        method, url, headers=headers,
+                        timeout=Config["request_timeout"], **kwargs
+                    )
                 if response.status_code != 200:
                     raise requests.RequestException(
                         f"HTTP {response.status_code}"
@@ -639,10 +538,11 @@ class BossDP:
                 print(f"请求{label}失败，将在{wait_seconds}秒后重试: {exc}")
                 time.sleep(wait_seconds)
         return None
-    def api_job_detail(self,security_id:str):#通过api获得详情信息
+    def api_job_detail(self, security_id: str, request_headers=None):
         url=f"{Config['base_url']}/wapi/zpgeek/job/detail.json"
         return self._request_json(
-            "get", url, label="详情", params={"securityId": security_id}
+            "get", url, label="详情", params={"securityId": security_id},
+            request_headers=request_headers,
         )
 #详情只需要需要工作介绍，详细地址，公司介绍
     @staticmethod
@@ -1048,106 +948,40 @@ class BossDP:
         return False
 
     def _human_click_job_action(self, job_list):
-        """每3次点击触发：犹豫点击行为（新拟人逻辑）"""
-        if not job_list:
-            return
-        with self.browser_lock:
-            try:
-                job_list_ele = self.page.ele('.rec-job-list', timeout=5)
-                if not job_list_ele:
-                    return
-                jobs = job_list_ele.eles('.job-card-box', timeout=3)
-                if not jobs:
-                    return
-
-                # 偏好前10个岗位
-                idx = random.randint(0, min(9, len(jobs) - 1))
-                target_job = jobs[idx]
-                job_name_ele = target_job.ele(".job-name", timeout=2)
-                job_name = job_name_ele.text if job_name_ele else f"岗位{idx+1}"
-
-                # 犹豫期：先滚动靠近目标，偶尔滚过头
-                for _ in range(random.randint(2, 4)):
-                    dist = random.randint(20, 60)
-                    if random.random() < 0.3:
-                        self.page.scroll.down(dist + random.randint(20, 40))
-                        time.sleep(random.uniform(0.2, 0.5))
-                        self.page.scroll.up(random.randint(20, 40))
-                    else:
-                        self.page.scroll.down(dist)
-                    time.sleep(random.uniform(0.3, 0.8))
-                time.sleep(random.uniform(0.8, 2.0))
-
-                print(f" [拟人-点击职位] 点击: {job_name}")
-                target_job.click()
-                time.sleep(random.uniform(1.5, 3))
-
-                # 快速浏览后返回
-                for _ in range(random.randint(1, 3)):
-                    self.page.scroll.down(random.randint(40, 100))
-                    time.sleep(random.uniform(0.3, 0.8))
-                time.sleep(random.uniform(1.0, 3.0))
-                print(" [拟人-点击职位] 返回列表页")
-                self.page.get(Config['start_url'])
-                time.sleep(random.uniform(1.5, 3))
-                self.get_cookie_headers()
-            except Exception as e:
-                print(f"  [拟人-点击职位] 异常: {e}")
-                try:
-                    self.page.get(Config['start_url'])
-                    time.sleep(2)
-                    self.get_cookie_headers()
-                except Exception:
-                    pass
+        """兼容旧采集入口，复用统一的轻量列表浏览。"""
+        self._human_navigate_interlude(job_list)
 
     def _human_enter_detail_action(self, job_list):
-        """每7次点击触发：深度阅读行为（新拟人逻辑）"""
-        if not job_list:
-            return
-        with self.browser_lock:
-            try:
-                job = random.choice(job_list[:min(8, len(job_list))])
-                job_name = job.get('jobName', '')
-                job_id = job.get('encryptJobId')
+        """兼容旧采集入口，不再额外打开详情或收藏岗位。"""
+        self._human_navigate_interlude(job_list)
 
-                if job_id:
-                    detail_url = f"https://www.zhipin.com/job_detail/{job_id}.html"
-                    print(f"  [拟人-深入] 深度阅读: {job_name}")
-                    self.page.get(detail_url)
-                    time.sleep(random.uniform(2, 4))
-
-                    # 来回滚动阅读
-                    scroll_rounds = random.randint(3, 6)
-                    for r in range(scroll_rounds):
-                        for _ in range(random.randint(2, 4)):
-                            self.page.scroll.down(random.randint(60, 150))
-                            time.sleep(random.uniform(0.4, 1.0))
-                        time.sleep(random.uniform(0.5, 1.5))
-                        for _ in range(random.randint(1, 3)):
-                            self.page.scroll.up(random.randint(50, 120))
-                            time.sleep(random.uniform(0.3, 0.8))
-
-                    time.sleep(random.uniform(3, 7))
-                    print("  [拟人-深入] 返回列表页")
-                    self.page.get(Config['start_url'])
-                    time.sleep(random.uniform(2, 4))
-                    self.get_cookie_headers()
-            except Exception as e:
-                print(f"  [拟人-深入] 异常: {e}")
-                try:
-                    self.page.get(Config['start_url'])
-                    time.sleep(2)
-                    self.get_cookie_headers()
-                except Exception:
-                    pass
+    def _begin_human_browse(self):
+        """Called under browser_lock; all optional browsing shares one cooldown."""
+        if not getattr(self, 'humanize_enabled', True):
+            return False
+        stop_event = getattr(self, 'stop_event', None)
+        if stop_event is not None and stop_event.is_set():
+            return False
+        now = time.monotonic()
+        last = getattr(self, '_last_human_browse_at', None)
+        if last is not None and now - last < Config['human_browse_cooldown']:
+            return False
+        if not self._is_search_page(self.page.url):
+            return False
+        self._last_human_browse_at = now
+        return True
 
     def _human_navigate_interlude(self, job_list):
-        """翻页前：随机浏览行为（新拟人逻辑）"""
-        if not job_list:
+        """在主流程安全节点执行一次列表浏览，不修改搜索筛选条件。"""
+        if not getattr(self, 'humanize_enabled', True) or not job_list:
             return
         with self.browser_lock:
+            started = False
             try:
-                action_type = random.choice(['quick_scan', 'scroll_list', 'open_detail_back', 'check_filters'])
+                if not self._begin_human_browse():
+                    return
+                started = True
+                action_type = random.choice(['quick_scan', 'scroll_list'])
 
                 if action_type == 'quick_scan':
                     print(" [拟人浏览] 快速扫描列表")
@@ -1174,45 +1008,11 @@ class BossDP:
                         time.sleep(random.uniform(0.5, 1.5))
                     time.sleep(random.uniform(1, 2))
 
-                elif action_type == 'open_detail_back':
-                    job = random.choice(job_list[:min(10, len(job_list))])
-                    job_id = job.get('encryptJobId')
-                    if job_id:
-                        detail_url = f"https://www.zhipin.com/job_detail/{job_id}.html"
-                        print(f" [拟人浏览] 快速打开: {job.get('jobName', '')}")
-                        self.page.get(detail_url)
-                        time.sleep(random.uniform(2, 4))
-                        for _ in range(random.randint(1, 3)):
-                            self.page.scroll.down(random.randint(50, 150))
-                            time.sleep(random.uniform(0.3, 0.8))
-                        time.sleep(random.uniform(1, 2))
-                        print(" [拟人浏览] 返回列表")
-                        self.page.get(Config['start_url'])
-                        time.sleep(random.uniform(1.5, 3))
-                        self.get_cookie_headers()
-
-                elif action_type == 'check_filters':
-                    print(" [拟人浏览] 查看筛选条件")
-                    self.page.scroll.to_top()
-                    time.sleep(random.uniform(0.5, 1.0))
-                    try:
-                        city_ele = self.page.ele('text:城市', timeout=2)
-                        if city_ele:
-                            city_ele.click()
-                            time.sleep(random.uniform(0.8, 1.5))
-                            self.page.get(Config['start_url'])
-                            time.sleep(random.uniform(1.5, 3))
-                    except:
-                        pass
-                    self.get_cookie_headers()
             except Exception as e:
                 print(f"  [拟人浏览] 异常: {e}")
-                try:
-                    self.page.get(Config['start_url'])
-                    time.sleep(2)
-                    self.get_cookie_headers()
-                except Exception:
-                    pass
+            finally:
+                if started:
+                    self._last_human_browse_at = time.monotonic()
 
     def crawl(self,max_pages,keyword:str=Config['keyword']):
         if os.path.exists(Config["output_file"]):
@@ -1360,7 +1160,6 @@ class BossDP:
                         time.sleep(random.uniform(1.0, 2.0))
                     else:
                         print("详情获取失败")
-                        self.page.close()
                 else:
                     print("缺少securityId")
                 if encrypt_job_id:
@@ -1373,19 +1172,10 @@ class BossDP:
                 
                 self.all_jobs.append(job_data)
                 
-                # 每3次点击触发一次点击职位行为，每7次点击触发一次进入详细行为
+                # Legacy milestones use the same browsing entry and cooldown.
                 self.click_job_count += 1
-                if self.click_job_count % 3 == 0:
-                    print(f"\n  [{idx}/{len(relevant_jobs)}] [拟人] 每3次点击职位行为...")
-                    self._human_click_job_action(job_list)
-                    self.get_cookie_headers()
-                
-                if self.click_job_count % 7 == 0:
-                    print(f"\n  [{idx}/{len(relevant_jobs)}] [拟人] 每7次点击职位进入详细行为...")
-                    self._human_enter_detail_action(job_list)
-                    self.get_cookie_headers()
-                    # 拟人操作后停顿，模拟回到列表继续浏览
-                    time.sleep(random.uniform(2.0, 4.0))
+                if self.click_job_count % 3 == 0 or self.click_job_count % 7 == 0:
+                    self._human_navigate_interlude(job_list)
                 
                 delay=random.uniform(*Config["job_delay"])
                 time.sleep(delay)
@@ -1451,7 +1241,7 @@ class BossDP:
             traceback.print_exc()
             self.save_to_csv(Config["output_file"])
         finally:
-            self.stop_event.set()
+            self.stop_heartbeat()
             # 清理
             try:
                 self.page.quit()

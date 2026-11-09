@@ -4,15 +4,16 @@ import io
 import threading
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import boss_spider
 import desktop_panel
 import platform_locations
+from DrissionPage.common import make_session_ele
 from auto_deliver import (
     AIClient,
     AutoDeliverer,
@@ -28,6 +29,7 @@ from auto_deliver import (
 )
 from ai_chains import JobMatchResponse, ProfileAssessment
 from candidate_profiles import CandidateEvidence, CandidateProfile, RoleFamily
+from delivery_tracker import DeliveryTracker
 from job_profiles import JobProfile
 from job_type_logic import (
     effective_job_type_preference,
@@ -48,6 +50,146 @@ def make_candidate_profile():
         excluded_role_families=["销售"],
         excluded_terms=["销售岗", "房地产经纪"],
     )
+
+
+class ExistingConversationTests(unittest.TestCase):
+    @staticmethod
+    def _detail_html(state="true", label="继续沟通", job_id="job-123"):
+        # Matches the two current-job actions in the saved example page.
+        action = (
+            '<a class="btn btn-startchat" data-isfriend="{state}" '
+            'redirect-url="/web/geek/chat?id=chat-1&amp;jobId={job_id}">'
+            '{label}</a>'
+        ).format(state=state, job_id=job_id, label=label)
+        return (
+            '<html><div class="job-op"><div class="btn-container">'
+            + action + '</div></div>'
+            '<div class="detail-op"><div class="btns">' + action + '</div></div>'
+            '<aside><a>沟通过</a><a>已投递</a></aside></html>'
+        )
+
+    def test_contact_state_checks_current_job_actions_not_navigation(self):
+        for state, label, expected in (
+            ("true", "继续沟通", "already_contacted"),
+            ("false", "立即沟通", "new_contact"),
+        ):
+            with self.subTest(state=state):
+                page = make_session_ele(self._detail_html(state, label))
+                self.assertEqual(
+                    AutoDeliverer._job_contact_state(page, "job-123"), expected
+                )
+
+        previous_job = make_session_ele(self._detail_html(job_id="other-job"))
+        self.assertEqual(
+            AutoDeliverer._job_contact_state(previous_job, "job-123"),
+            "unknown",
+        )
+        navigation_only = make_session_ele(
+            '<html><aside><a>沟通过</a><a>已投递</a></aside></html>'
+        )
+        self.assertEqual(
+            AutoDeliverer._job_contact_state(navigation_only, "job-123"),
+            "unknown",
+        )
+
+    def test_prepare_job_records_existing_conversation_without_ai(self):
+        deliverer = AutoDeliverer.__new__(AutoDeliverer)
+        deliverer.cfg = {"welfare_require": []}
+        deliverer.seen_job_ids = set()
+        deliverer.stage_counts = {}
+        deliverer.tracker = SimpleNamespace(mark=Mock())
+        deliverer._record = Mock()
+        deliverer._fetch_jd_dom = Mock(return_value={
+            "already_contacted": True,
+            "desc": "",
+            "skills": [],
+            "welfare_tags": [],
+            "company_url": "",
+        })
+        job = {
+            "encryptJobId": "job-123",
+            "工作名称": "AI 应用开发实习生",
+            "公司": "示例公司",
+        }
+
+        self.assertFalse(deliverer._prepare_job(job))
+        self.assertEqual(deliverer._record.call_count, 1)
+        recorded = deliverer._record.call_args.args[0]
+        self.assertEqual(recorded["投递状态"], "already_contacted")
+        self.assertEqual(recorded["打招呼语"], "")
+        self.assertEqual(deliverer.seen_job_ids, {"job-123"})
+        self.assertEqual(deliverer.stage_counts.get("already_contacted"), 1)
+        self.assertEqual(deliverer.stage_counts.get("eligible_for_ai", 0), 0)
+        deliverer.tracker.mark.assert_called_once_with(
+            "job-123", "AI 应用开发实习生", "", "already_contacted",
+            count_delivery=False,
+        )
+
+    def test_detail_fetch_detects_existing_conversation_before_reading_jd(self):
+        detail = make_session_ele(self._detail_html())
+        tab = SimpleNamespace(
+            wait=SimpleNamespace(doc_loaded=Mock()),
+            ele=Mock(),
+            eles=detail.eles,
+        )
+        deliverer = AutoDeliverer.__new__(AutoDeliverer)
+        deliverer.browser_lock = threading.RLock()
+        deliverer.cfg = {"detail_delay": (0, 0)}
+        deliverer._detail_tab_get = Mock(return_value=tab)
+
+        with patch("auto_deliver.time.sleep") as sleep:
+            result = deliverer._fetch_jd_dom({
+                "encryptJobId": "job-123",
+                "详情链接": "https://www.zhipin.com/job_detail/job-123.html",
+            })
+
+        self.assertTrue(result["already_contacted"])
+        tab.ele.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_delivery_rechecks_status_before_opening_chat(self):
+        page = SimpleNamespace(
+            url="",
+            tab_ids={"main"},
+            scroll=SimpleNamespace(down=Mock(), to_top=Mock()),
+            get=Mock(),
+            ele=Mock(),
+            eles=make_session_ele(self._detail_html()).eles,
+        )
+        page.get.side_effect = lambda url: setattr(page, "url", url)
+        deliverer = AutoDeliverer.__new__(AutoDeliverer)
+        deliverer.browser_lock = threading.RLock()
+        deliverer.page = page
+        deliverer.cfg = {"detail_delay": (0, 0)}
+        deliverer.humanize_enabled = False
+        deliverer._resume_browser_if_needed = Mock()
+        deliverer._check_browser_attention = Mock(return_value=False)
+        deliverer._send_greeting_in_chat = Mock()
+
+        with patch("auto_deliver.time.sleep"):
+            status = deliverer.deliver_one(
+                {"详情链接": "https://www.zhipin.com/job_detail/job-123.html",
+                 "encryptJobId": "job-123"},
+                "Please do not send a second greeting",
+            )
+
+        self.assertEqual(status, "already_contacted")
+        page.ele.assert_not_called()
+        deliverer._send_greeting_in_chat.assert_not_called()
+
+    def test_existing_conversation_does_not_consume_daily_delivery_quota(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = str(Path(temp_dir) / "delivery.json")
+            tracker = DeliveryTracker(log_file)
+            tracker.mark(
+                "job-123", "AI 应用开发实习生", "",
+                "already_contacted", count_delivery=False,
+            )
+            self.assertEqual(tracker.data["count"], 0)
+            self.assertTrue(tracker.already_done("job-123"))
+            restored = DeliveryTracker(log_file)
+            self.assertEqual(restored.data["count"], 0)
+            self.assertTrue(restored.already_done("job-123"))
 
 
 class CandidateScopeTests(unittest.TestCase):
@@ -874,6 +1016,36 @@ class PlatformSearchFilterTests(unittest.TestCase):
         self.assertEqual(saved["PLATFORM_AREA_FILTER"], "南山区,福田区")
         self.assertEqual(saved["PLATFORM_JOB_TYPE"], "实习")
 
+    def test_every_panel_setting_round_trips_through_env_file(self):
+        values = {}
+        for key, _group, _label, field_type, default, _note in desktop_panel.FIELDS:
+            if field_type == "bool":
+                values[key] = "true"
+            elif field_type == "multiselect":
+                values[key] = "南山区,福田区" if key == "PLATFORM_AREA_FILTER" else "双休,五险一金"
+            elif field_type == "multiline":
+                values[key] = "请称呼 ${岗位名}。\n保留引号：'样例'，路径 C:\\work"
+            elif field_type == "select":
+                values[key] = desktop_panel.SELECT_OPTIONS[key][0]
+            else:
+                values[key] = default
+        values.update({
+            "DELIVER_KEYWORD": "测试岗位",
+            "AREA_FILTER": "南山,福田",
+            "DELIVER_MAX_PAGES": "3",
+            "TEST_LIMIT": "20",
+        })
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            with patch.object(desktop_panel, "ENV_FILE", env_path):
+                desktop_panel.write_env_file(values)
+                persisted = desktop_panel.read_env_dict()
+                written_env = env_path.read_text(encoding="utf-8")
+
+        self.assertEqual(persisted, values)
+        self.assertIn("${岗位名}", written_env)
+
     def test_tavily_settings_persist_without_dropping_existing_env_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -900,7 +1072,9 @@ class CandidateProfileStartupGuardTests(unittest.TestCase):
             _collect_values=lambda: {"DRY_RUN": "true"},
             runner=runner,
             append_log=logs.append,
+            config_notice=Mock(),
         )
+        app._persist_config = lambda values: desktop_panel.PanelApp._persist_config(app, values)
         missing_store = SimpleNamespace(load=lambda: None)
 
         with patch.object(desktop_panel, "CandidateProfileStore", return_value=missing_store, create=True), \
@@ -913,6 +1087,23 @@ class CandidateProfileStartupGuardTests(unittest.TestCase):
         write_env.assert_called_once()
         showwarning.assert_not_called()
         self.assertTrue(any("基础画像" in line for line in logs))
+        app.config_notice.show_message.assert_called_once_with("配置已保存，任务已启动")
+
+    def test_panel_does_not_start_when_config_save_fails(self):
+        app = SimpleNamespace(
+            _collect_values=lambda: {"DELIVER_KEYWORD": "AI", "DRY_RUN": "true"},
+            runner=Mock(),
+            append_log=Mock(),
+            config_notice=Mock(),
+        )
+        app._persist_config = lambda values: desktop_panel.PanelApp._persist_config(app, values)
+        with patch.object(desktop_panel, "candidate_profile_startup_error", return_value=None), \
+                patch.object(desktop_panel.CandidateProfileStore, "load", return_value=None), \
+                patch.object(desktop_panel, "write_env_file", side_effect=OSError("disk full")):
+            desktop_panel.PanelApp.start_task(app)
+
+        app.runner.start.assert_not_called()
+        self.assertEqual(app.config_notice.show_message.call_args.kwargs, {"kind": "error"})
 
     def test_panel_blocks_task_without_a_target_job(self):
         runner = SimpleNamespace(start=lambda: self.fail("task runner must not start"), running=lambda: False)
@@ -1098,15 +1289,39 @@ class CandidateProfileStartupGuardTests(unittest.TestCase):
             "keyword": "AI应用开发",
         }
 
-        url = configure_platform_search({
-            "platform_area_filter": ["南山区"],
-            "platform_job_type": "实习",
-        }, spider_config)
+        with patch.object(platform_locations, "fetch_platform_districts", return_value=[
+            {"name": "南山区", "code": "440305"},
+        ]):
+            url = configure_platform_search({
+                "platform_area_filter": ["南山区"],
+                "platform_job_type": "实习",
+            }, spider_config)
 
         self.assertEqual(spider_config["multiBusinessDistrict"], "440305")
         self.assertEqual(spider_config["jobType"], "1902")
         self.assertIn("multiBusinessDistrict=440305", url)
         self.assertIn("jobType=1902", url)
+
+    def test_platform_industry_accepts_multiple_ids_and_boss_search_url(self):
+        spider_config = {
+            "base_url": "https://www.zhipin.com",
+            "city_id": "101280600",
+            "position": "",
+            "keyword": "AI应用开发",
+        }
+
+        url = configure_platform_search({
+            "platform_industry": (
+                "https://www.zhipin.com/web/geek/jobs"
+                "?city=101280600&industry=100020,100007,100002"
+            ),
+        }, spider_config)
+
+        self.assertEqual(spider_config["industry"], "100020,100007,100002")
+        self.assertEqual(
+            parse_qs(urlparse(url).query)["industry"],
+            ["100020,100007,100002"],
+        )
 
     def test_other_city_area_filter_is_verified_and_passed_with_job_type(self):
         spider_config = {
@@ -1497,7 +1712,10 @@ class PrefilterTests(unittest.TestCase):
             ["full-1", "full-2", "intern-1", "intern-2", "unknown-1"],
         )
 
-        deliverer.cfg.update({"platform_job_type": "实习", "job_type_preference": "全职"})
+        deliverer.cfg.update({
+            "platform_job_type": "实习",
+            "job_type_preference": "全职",
+        })
         prioritized = deliverer._prioritize_jobs_by_type(jobs)
         self.assertEqual(
             [job["encryptJobId"] for job in prioritized],
@@ -1558,6 +1776,31 @@ class PrefilterTests(unittest.TestCase):
         self.assertEqual(deliverer.stage_counts["area_rejected"], 1)
         self.assertEqual(deliverer.stage_counts["already_done"], 1)
         self.assertEqual(deliverer.stage_counts["candidate_ready"], 1)
+
+    def test_area_filter_matches_either_district_or_business_district(self):
+        deliverer = AutoDeliverer.__new__(AutoDeliverer)
+        deliverer.seen_job_ids = set()
+        deliverer.stage_counts = {}
+        deliverer.cfg = {"area_filter": ["南山", "福田"]}
+        deliverer.profile_mode = True
+        deliverer._is_blacklisted_company = lambda _company: False
+        deliverer._is_truncated_name = lambda _company: False
+        deliverer.tracker = SimpleNamespace(already_done=lambda _job_id: False)
+        deliverer._format_list = lambda items: "; ".join(items or [])
+        jobs = [
+            {"encryptJobId": "match-area", "jobName": "后端工程师", "areaDistrict": "南山区"},
+            {"encryptJobId": "match-business", "jobName": "后端工程师", "businessDistrict": "福田CBD"},
+            {"encryptJobId": "reject", "jobName": "后端工程师", "areaDistrict": "宝安区"},
+            {"encryptJobId": "unknown", "jobName": "后端工程师"},
+        ]
+
+        candidates = deliverer._filter_jobs(jobs)
+
+        self.assertEqual(
+            [job["encryptJobId"] for job in candidates],
+            ["match-area", "match-business", "unknown"],
+        )
+        self.assertEqual(deliverer.stage_counts["area_rejected"], 1)
 
     def test_role_filter_rejects_clear_teaching_role_with_teaching_duties(self):
         reason = AutoDeliverer._role_function_reject({
@@ -2060,7 +2303,7 @@ class MatchingPromptTests(unittest.TestCase):
                 candidate_profile=profile,
             )
 
-        prompt = captured["messages"][0]["content"]
+        prompt = captured["messages"][1]["content"]
         self.assertIn("我的画像", prompt)
         self.assertIn("AI 应用研发", prompt)
         self.assertIn("有 RAG 项目实践", prompt)
@@ -2189,6 +2432,32 @@ class ResultSchemaTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_run_returns_process_status_for_top_level_failures_and_interruptions(self):
+        for error, expected_code in (
+            (RuntimeError("startup failed"), 1),
+            (KeyboardInterrupt(), 130),
+        ):
+            with self.subTest(expected_code=expected_code):
+                deliverer = AutoDeliverer.__new__(AutoDeliverer)
+                deliverer.cfg = {
+                    "test_limit": 0,
+                    "dry_run": False,
+                    "login_wait": 0,
+                }
+
+                def fail_login(_timeout):
+                    raise error
+
+                deliverer.wait_login = fail_login
+                deliverer.save_results = lambda: None
+                deliverer._print_stage_summary = lambda: None
+                deliverer.stop_event = SimpleNamespace(set=lambda: None)
+                deliverer.page = SimpleNamespace(quit=lambda: None)
+                deliverer.deliver_count = 0
+
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(deliverer.run(), expected_code)
+
     def _make_deliverer(self, score, dry_run=True):
         from ai_chains import JobMatchResponse, ProfileAssessment
         from job_profiles import JobProfile
@@ -2347,7 +2616,11 @@ class PipelineTests(unittest.TestCase):
             "工作介绍": "负责后端服务开发。",
             "详情链接": "https://example.invalid/intern",
         }
-        deliverer.cfg.update({"platform_job_type": "实习", "job_type_preference": "全职"})
+        deliverer.cfg.update({
+            "platform_job_type": "实习",
+            "job_type_preference": "全职",
+            "deliver_max_pages": 2,
+        })
         deliverer.matching_context["allocations"] = [
             {"keyword": "AI应用开发", "profile_ids": ["backend"], "pages": [1, 2]},
         ]
@@ -2440,6 +2713,198 @@ class PipelineTests(unittest.TestCase):
             side_effect=AssertionError("dry-run must not call delivery")
         )
         return deliverer
+
+    def test_run_continues_searching_pages_until_processing_target_is_met(self):
+        first_job = {
+            "encryptJobId": "unavailable-job",
+            "工作名称": "Python 后端工程师",
+            "公司": "示例公司",
+            "工作性质": "实习",
+            "工作介绍": "负责后端接口开发。",
+            "详情链接": "https://example.invalid/unavailable",
+        }
+        second_job = {
+            **first_job,
+            "encryptJobId": "available-job",
+            "详情链接": "https://example.invalid/available",
+        }
+        deliverer = self._make_profiled_deliverer({"后端": [], "Python API": []})
+        deliverer.cfg["test_limit"] = 1
+        deliverer.cfg["deliver_max_pages"] = 3
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda listing: [dict(item) for item in listing]
+        deliverer._prepare_job = lambda job: job["encryptJobId"] == "available-job"
+        requests = []
+
+        def list_jobs(page, keyword):
+            requests.append((keyword, page))
+            jobs = {1: [first_job], 2: [second_job], 3: []}[page]
+            return {"zpData": {"jobList": jobs}}
+
+        deliverer.api_job_list = list_jobs
+
+        with patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(requests, [("后端", 1), ("后端", 2)])
+        self.assertEqual(deliverer.scoring_chain.invoke.call_count, 1)
+        self.assertEqual(deliverer._recorded[0]["encryptJobId"], "available-job")
+        self.assertEqual(deliverer._recorded[0]["投递状态"], "dry_run")
+
+    def test_finite_target_counts_ai_attempts_not_deliveries(self):
+        jobs = [
+            {
+                "encryptJobId": f"target-{index}",
+                "工作名称": "Python 后端工程师",
+                "公司": "示例公司",
+                "工作性质": "实习",
+                "工作介绍": "负责后端接口开发。",
+                "详情链接": f"https://example.invalid/{index}",
+            }
+            for index in range(2)
+        ]
+        deliverer = self._make_profiled_deliverer({"后端": []})
+        deliverer.cfg["test_limit"] = 2
+        deliverer.cfg["deliver_max_pages"] = 5
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda listing: [dict(item) for item in listing]
+        requested_pages = []
+
+        def list_jobs(page, keyword):
+            requested_pages.append(page)
+            return {"zpData": {"jobList": jobs}}
+
+        deliverer.api_job_list = list_jobs
+        deliverer.scoring_chain.invoke.side_effect = [
+            deliverer.scoring_chain.invoke.return_value,
+            RuntimeError("second evaluation failed"),
+            deliverer.scoring_chain.invoke.return_value,
+        ]
+
+        with patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(requested_pages, [1])
+        self.assertEqual(deliverer.scoring_chain.invoke.call_count, 2)
+
+    def test_run_stops_fetching_pages_when_processing_target_is_met(self):
+        job = {
+            "encryptJobId": "target-job",
+            "工作名称": "Python 后端工程师",
+            "公司": "示例公司",
+            "工作性质": "实习",
+            "工作介绍": "负责后端接口开发。",
+            "详情链接": "https://example.invalid/job",
+        }
+        deliverer = self._make_profiled_deliverer({"后端": [], "Python API": []})
+        deliverer.cfg["test_limit"] = 1
+        deliverer.cfg["deliver_max_pages"] = 5
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda listing: [dict(item) for item in listing]
+        requested_pages = []
+
+        def list_jobs(page, keyword):
+            requested_pages.append(page)
+            return {"zpData": {"jobList": [job]}}
+
+        deliverer.api_job_list = list_jobs
+
+        with patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(requested_pages, [1])
+        self.assertEqual(deliverer.scoring_chain.invoke.call_count, 1)
+
+    def test_dynamic_pages_share_configured_request_budget_across_queries(self):
+        deliverer = self._make_profiled_deliverer({"后端": [], "Python API": []})
+        deliverer.cfg["deliver_max_pages"] = 3
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+            {"keyword": "Python API", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda _listing: []
+        requests = []
+
+        def list_jobs(page, keyword):
+            requests.append((keyword, page))
+            return {"zpData": {"jobList": [{"encryptJobId": f"filtered-{keyword}-{page}"}]}}
+
+        deliverer.api_job_list = list_jobs
+
+        with patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(requests, [("后端", 1), ("Python API", 1), ("后端", 2)])
+
+    def test_job_target_expands_search_beyond_legacy_page_cap(self):
+        target = 20
+        deliverer = self._make_profiled_deliverer({"后端": []})
+        deliverer.cfg["test_limit"] = target
+        deliverer.cfg["deliver_max_pages"] = 3
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda listing: [dict(job) for job in listing]
+        requested_pages = []
+
+        def list_jobs(page, keyword):
+            requested_pages.append(page)
+            job = {
+                "encryptJobId": f"target-{page}",
+                "工作名称": "Python 后端工程师",
+                "公司": "示例公司",
+                "工作性质": "实习",
+                "工作介绍": "负责后端接口开发。",
+                "详情链接": f"https://example.invalid/{page}",
+            }
+            return {"zpData": {"jobList": [job]}}
+
+        deliverer.api_job_list = list_jobs
+
+        with patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(requested_pages, list(range(1, target + 1)))
+        self.assertEqual(deliverer.scoring_chain.invoke.call_count, target)
+
+    def test_finite_target_reports_when_search_safety_ceiling_is_reached(self):
+        target = 60
+        deliverer = self._make_profiled_deliverer({"后端": []})
+        deliverer.cfg["test_limit"] = target
+        deliverer.cfg["deliver_max_pages"] = 3
+        deliverer.matching_context["allocations"] = [
+            {"keyword": "后端", "profile_ids": ["backend-profile"], "pages": [1]},
+        ]
+        deliverer._filter_jobs = lambda listing: [dict(job) for job in listing]
+        requested_pages = []
+
+        def list_jobs(page, keyword):
+            requested_pages.append(page)
+            job = {
+                "encryptJobId": f"target-{page}",
+                "工作名称": "Python 后端工程师",
+                "公司": "示例公司",
+                "工作性质": "实习",
+                "工作介绍": "负责后端接口开发。",
+                "详情链接": f"https://example.invalid/{page}",
+            }
+            return {"zpData": {"jobList": [job]}}
+
+        deliverer.api_job_list = list_jobs
+        output = io.StringIO()
+
+        with redirect_stdout(output), patch("auto_deliver.time.sleep"):
+            deliverer.run()
+
+        self.assertEqual(len(requested_pages), 50)
+        self.assertEqual(deliverer.scoring_chain.invoke.call_count, 50)
+        self.assertIn("搜索请求安全上限 50", output.getvalue())
 
     def test_duplicate_job_from_multiple_queries_is_scored_once_in_dry_run(self):
         shared_job = {

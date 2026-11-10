@@ -1,6 +1,6 @@
 # Quiet Startup and Background Browser
 
-Updated: 2026-11-09
+Updated: 2026-11-10
 
 ## Starting the Panel
 
@@ -50,18 +50,51 @@ after an actual test showed that opening a background tab made it visible again.
   avatar again. If this check fails, it keeps a visible browser for that run
   instead of switching repeatedly. Disabling the setting always uses a visible
   browser.
-- The heartbeat only signals known login/security routes. The main flow handles
-  them between browser operations. The heartbeat does not restart the browser
-  or alter the QR page while login is in progress.
+- The heartbeat signals known login routes for the main flow to handle between
+  browser operations. Known security routes stop the run. The heartbeat does
+  not restart the browser or alter the QR page while login is in progress.
 - Login polling does not periodically reload the QR code. A positive
   `LOGIN_WAIT` stops the task on expiry; zero continues waiting.
-- A verification interruption after clicking a communication button is reported
-  as a chat failure; it does not automatically repeat that action.
+- A known security route or visible restriction alert interrupts the run with
+  exit code 3. Results already completed are saved; the panel shows `平台限制`.
+  The task does not automatically repeat the action or resume. Review the
+  official page before restarting. See [runtime-heartbeat.md](runtime-heartbeat.md).
 
 Login checks still depend on the site's rendered `.nav-figure` element and known
 login/security routes. These checks are not a guarantee of server authentication
 or live-site compatibility. Session storage tied to an individual tab is not
 transferred when Chromium restarts.
+
+## Result Links
+
+The results table includes a job-link icon beside the job title. Both that icon
+and the drawer's open-link action launch the project browser discovered by
+`resolve_browser_path`, honoring saved `BROWSER_PATH`, with the corresponding
+platform's existing profile and `Default` profile directory. BOSS also reuses
+its saved user agent. No cookies are copied to another directory or the system
+default browser. Old records without a platform infer it from the official job
+URL; missing, unsupported, or mismatched links do not launch a browser.
+
+This requires `KEEP_LOGIN=true`. A task using a temporary profile cannot provide
+the same login after it ends, so the panel reports that condition instead of
+silently opening a different profile. An active task blocks the open action.
+The launcher also detects an externally started headless browser using that
+exact platform profile. A visible project browser can accept further windows
+with the same profile. Before the next task starts, the panel checks that its
+selected platforms' profile directories are free and asks the user to close
+those browser windows; it does not kill the manual browser.
+
+Persistent task profiles and manually opened result windows use
+`--restore-last-session` to preserve session cookies across a normal browser
+exit. Previous tabs may also be restored. This is Chromium session restoration,
+not a guarantee that the platform has not expired or revoked the login. The
+behavior follows Chromium's [user data directory documentation](https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md),
+which specifies `--user-data-dir` and notes that two browser instances cannot
+share a user data directory concurrently.
+
+Manual result links do not start scoring, sending, or application workflows.
+Liepin automation remains paused; a user can still explicitly open its historical
+job links in that platform's existing browser profile.
 
 ## Verification
 
@@ -87,3 +120,18 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 
 The initial console-only smoke check missed the Qt label windows. The startup
 checks now cover both console visibility and every top-level Qt show event.
+
+For the result-link change (2026-11-10), `scripts/verify_result_browser.py` uses a
+temporary browser profile and localhost to check persistent cookies, session
+cookies, local storage, a visible result window, and profile-conflict detection.
+It also checks reopening the same profile in background mode after manual
+viewing. It does not access recruiting sites or personal browser profiles.
+Screenshots at 1420 x 900 and 1180 x 760 cover the new column and missing-link
+disabled state. Focused Qt tests cover sorting, filtering, the drawer action,
+and error messages.
+
+Final result-link validation: 475 tests and 202 subtests passed; all 8 localhost
+browser checks passed, including return to the actual task browser opener.
+Sensitive-data scan and `git diff --check` passed. The existing `psutil`
+dependency from DrissionPage is now declared directly because result opening
+uses its process inspection API. No EXE or installer was rebuilt.

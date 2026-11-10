@@ -39,6 +39,7 @@ from job_profiles import (
 
 from boss_spider import (
     BossDP,
+    PlatformAccessStopped,
     Config as SpiderConfig,
     JOB_TYPE_CODES,
     build_job_search_url,
@@ -88,6 +89,8 @@ from ai_client import AIClient, _truncate_reason
 from delivery_tracker import DeliveryTracker
 from result_store import ResultRecorder
 from job_type_logic import effective_job_type_preference
+from job_platforms import PLATFORM_LABELS, city_name
+from platform_job_parser import candidate_row
 
 
 # ========================= 自动投递主类 =========================
@@ -102,7 +105,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
         history_ids = self._load_processed_job_ids(
             deliver_cfg["result_file"], dry_run=deliver_cfg["dry_run"],
         )
-        super().__init__()
+        self._init_browser_runtime(deliver_cfg)
         self.seen_job_ids.update(history_ids)
         print(f"[去重] 已载入历史已处理岗位 {len(history_ids)} 个")
         self.cfg = deliver_cfg
@@ -141,12 +144,15 @@ class AutoDeliverer(BossDP, ResultRecorder):
             "delivery_attempted": 0,
             "delivered": 0,
         }
-        # 拟人浏览只在主流程的安全节点执行。
+        # 轻量列表浏览只在主流程的安全节点执行。
         self.humanize_enabled = deliver_cfg["humanize_enable"]
         self.match_scores = {}   # 岗位名 -> AI 匹配分
         self.company_welfare_cache = {}   # 公司主页URL -> 工作时间及福利文本
         self._detail_tab = None   # 复用的详情页标签（后台标签，避免每开一个岗位就弹窗）
         self._human_browse_job_list = []
+
+    def _init_browser_runtime(self, deliver_cfg):
+        super().__init__()
 
     @staticmethod
     def _load_resume(path: str) -> str:
@@ -356,7 +362,15 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 self.seen_job_ids.add(job_id)
                 continue
 
+            if job.get("platform") in ("zhilian", "liepin"):
+                candidate = candidate_row(job)
+                candidate["工作性质"] = self._classify_job_type(job)
+                candidates.append(candidate)
+                self._count_stage("candidate_ready")
+                continue
+
             candidates.append({
+                '平台': PLATFORM_LABELS['boss'],
                 'encryptJobId': job_id,
                 'securityId': job.get('securityId', ''),
                 '工作名称': job.get('jobName', ''),
@@ -546,8 +560,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
             return None
 
     def _fetch_jd_dom(self, job: dict):
-        """新标签页打开详情页，从 DOM 读取职位描述、技能标签、福利标签、公司主页链接。
-        模拟真实用户浏览行为，稳定不触发「环境异常」。"""
+        """复用详情标签，从 DOM 读取职位描述、标签和公司主页链接。"""
         url = job["详情链接"]
         if job.get("securityId"):
             url += f"?securityId={job['securityId']}"
@@ -564,7 +577,9 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 if self._job_contact_state(tab, job.get("encryptJobId", "")) == "already_contacted":
                     return {"already_contacted": True}
                 dwell_range = self.cfg.get("detail_delay", (3, 6))
-                time.sleep(random.uniform(*dwell_range))  # 模拟阅读详情
+                time.sleep(random.uniform(*dwell_range))
+                if self._check_browser_attention(tab):
+                    return {'desc': '', 'skills': [], 'welfare_tags': [], 'company_url': ''}
                 if self._job_contact_state(tab, job.get("encryptJobId", "")) == "already_contacted":
                     return {"already_contacted": True}
 
@@ -641,7 +656,9 @@ class AutoDeliverer(BossDP, ResultRecorder):
                     tab.wait.doc_loaded(timeout=15)
                 except Exception:
                     pass
-                time.sleep(random.uniform(*self.cfg["detail_delay"]))  # 模拟浏览公司页
+                time.sleep(random.uniform(*self.cfg["detail_delay"]))
+                if self._check_browser_attention(tab):
+                    return ''
                 # 公司页部分卡片懒加载，轻滚几下再取文本
                 try:
                     tab.scroll.down(400)
@@ -708,13 +725,8 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 if self._check_browser_attention(self.page):
                     self.page.get(detail_url)
                 time.sleep(random.uniform(*self.cfg.get("detail_delay", (3, 6))))
-
-                if getattr(self, "humanize_enabled", True):
-                    for _ in range(random.randint(2, 4)):
-                        self.page.scroll.down(random.randint(50, 120))
-                        time.sleep(random.uniform(0.4, 0.9))
-                    self.page.scroll.to_top()
-                    time.sleep(random.uniform(0.5, 1.2))
+                if self._check_browser_attention(self.page):
+                    return "chat_failed"
 
                 job_id = job.get("encryptJobId", "")
                 buttons = self._job_contact_buttons(self.page)
@@ -770,8 +782,9 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 return "error"
 
     def _human_browse_after_delivery(self):
-        """投递后恢复到当前搜索页，再同步登录态并穿插列表浏览。"""
-        if not getattr(self, "humanize_enabled", True):
+        """可见窗口按需返回搜索列表，复用轻量浏览的冷却时间。"""
+        if (not getattr(self, "humanize_enabled", True)
+                or getattr(self, "_browser_headless", False)):
             return
         try:
             with self.browser_lock:
@@ -788,19 +801,26 @@ class AutoDeliverer(BossDP, ResultRecorder):
                                 or current.path.rstrip('/') in (
                                     '/web/geek/chat', '/web/geek/jobs'))):
                     return
-                self.page.get(SpiderConfig["start_url"])
-                time.sleep(random.uniform(1.5, 3.0))
+                self._check_platform_page(self.page)
+                if not self._is_search_page(self.page.url):
+                    self.page.get(SpiderConfig["start_url"])
+                    time.sleep(random.uniform(1.5, 3.0))
+                    if self._check_browser_attention(self.page):
+                        return
                 self.get_cookie_headers()
                 self._human_navigate_interlude(self._human_browse_job_list)
+        except (TimeoutError, InterruptedError):
+            raise
         except Exception as exc:
-            print(f"  [拟人浏览] 投递后恢复列表页失败: {exc}")
+            print(f"  [轻量浏览] 投递后恢复列表页失败: {exc}")
 
     def _after_successful_delivery(self):
         """按配置间隔恢复浏览行为或刷新登录态。"""
+        self._raise_if_platform_stopped()
         every_n = int(self.cfg.get("human_every_n", 0) or 0)
         if every_n <= 0 or self.deliver_count % every_n != 0:
             return
-        if self.humanize_enabled:
+        if self.humanize_enabled and not getattr(self, "_browser_headless", False):
             self._human_browse_after_delivery()
         else:
             self.get_cookie_headers()
@@ -808,6 +828,8 @@ class AutoDeliverer(BossDP, ResultRecorder):
     def _send_greeting_in_chat(self, tab, greeting: str) -> str:
         """在聊天窗口输入并发送打招呼语。"""
         try:
+            if self._check_browser_attention(tab):
+                return "chat_failed"
             # 找输入框：常见为 #chat-input 或 .chat-input / textarea
             box = (tab.ele('#chat-input', timeout=6)
                    or tab.ele('.chat-input', timeout=3)
@@ -824,19 +846,23 @@ class AutoDeliverer(BossDP, ResultRecorder):
 
             box.click()
             time.sleep(random.uniform(0.5, 1.0))
-            # 拟人逐字输入
-            interval = random.uniform(0.03, 0.09) if getattr(self, "humanize_enabled", True) else 0
-            tab.actions.type(greeting, interval=interval)
+            tab.actions.type(greeting, interval=0)
             time.sleep(random.uniform(0.8, 1.8))  # 发送前停顿
 
+            if self._check_browser_attention(tab):
+                return "chat_failed"
             send_btn = tab.ele('.btn-send', timeout=3) or tab.ele('text:发送', timeout=2)
+            self._raise_if_platform_stopped()
             if send_btn:
                 send_btn.click()
             else:
                 tab.actions.key_down('Enter').key_up('Enter')
             time.sleep(random.uniform(1.5, 2.5))
+            self._check_platform_page(tab)
             print("  [投递] 打招呼语已发送")
             return "delivered"
+        except (TimeoutError, InterruptedError):
+            raise
         except Exception as exc:
             print(f"  [投递] 发送失败: {exc}")
             return "send_failed"
@@ -874,20 +900,33 @@ class AutoDeliverer(BossDP, ResultRecorder):
         requests_made = 0
         exhausted_queries = set()
         failed_queries = set()
+        repeated_queries = set()
         query_keywords = {item["keyword"] for item in allocations}
+        page_signatures = {keyword: set() for keyword in query_keywords}
+        listed_ids = {keyword: set() for keyword in query_keywords}
+        repeat_streaks = dict.fromkeys(query_keywords, 0)
+        self.search_query_stats = {
+            item["keyword"]: {
+                "requests": 0, "listed": 0, "unique_listed": 0,
+                "new_candidates": 0, "stop_reason": "",
+            } for item in allocations
+        }
 
         # Share the search-request budget across queries, reusing capacity when
         # one query runs out before the others. Batch enough candidates to apply
         # job-type and scope prioritization before details reveal any rejections.
         while requests_made < page_budget:
+            self._raise_if_platform_stopped()
             queued_by_id = {}
             last_job_list = None
             requests_this_round = 0
             for allocation in allocations:
+                self._raise_if_platform_stopped()
                 keyword = allocation["keyword"]
-                if keyword in exhausted_queries or keyword in failed_queries \
+                if keyword in exhausted_queries | failed_queries | repeated_queries \
                         or requests_made >= page_budget:
                     continue
+                stats = self.search_query_stats[keyword]
                 if initial_pages[keyword]:
                     page = initial_pages[keyword].pop(0)
                 else:
@@ -895,6 +934,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 next_page[keyword] = max(next_page[keyword], page + 1)
                 requests_made += 1
                 requests_this_round += 1
+                stats["requests"] += 1
                 print(f"\n[采集] 第{page}页 关键词: {keyword}"
                       f" | 画像: {', '.join(allocation['profile_ids'])}")
                 try:
@@ -902,18 +942,43 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 except (TimeoutError, InterruptedError):
                     raise
                 except Exception as exc:
+                    self._raise_if_platform_stopped()
                     print(f"[采集] 查询失败，继续其他查询: {keyword}: {exc}")
                     failed_queries.add(keyword)
+                    stats["stop_reason"] = "查询失败"
+                    initial_pages[keyword].clear()
                     continue
+                self._raise_if_platform_stopped()
                 if not list_result:
                     print(f"[采集] 查询失败，继续其他查询: {keyword}")
                     failed_queries.add(keyword)
+                    stats["stop_reason"] = "查询失败"
+                    initial_pages[keyword].clear()
                     continue
                 job_list = ((list_result.get("zpData") or {}).get("jobList") or [])
                 if not job_list:
                     print(f"[采集] {keyword} 第{page}页没有更多岗位")
                     exhausted_queries.add(keyword)
+                    stats["stop_reason"] = "空页"
+                    initial_pages[keyword].clear()
                     continue
+                stats["listed"] += len(job_list)
+                signature = frozenset(job.get("encryptJobId") for job in job_list)
+                listed_ids[keyword].update(job_id for job_id in signature if job_id)
+                stats["unique_listed"] = len(listed_ids[keyword])
+                # Only complete page identities prove repetition. History filters
+                # and overlap with other queries must not exhaust this query.
+                if all(signature):
+                    repeated = signature in page_signatures[keyword]
+                    repeat_streaks[keyword] = repeat_streaks[keyword] + 1 if repeated else 0
+                    page_signatures[keyword].add(signature)
+                else:
+                    repeat_streaks[keyword] = 0
+                if repeat_streaks[keyword] >= 2:
+                    repeated_queries.add(keyword)
+                    initial_pages[keyword].clear()
+                    stats["stop_reason"] = "连续重复页"
+                    print(f"[采集] {keyword or '平台推荐'} 连续2页重复已见整页岗位，停止该查询")
                 last_job_list = job_list
                 self._human_browse_job_list.extend(job_list)
 
@@ -935,6 +1000,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
                         job["来源岗位画像"] = list(allocation["profile_ids"])
                         job["工作性质"] = self._classify_job_type(job)
                         queued_by_id[job_id] = job
+                        stats["new_candidates"] += 1
             queued_job_ids.update(queued_by_id)
             candidate_buffer.update(queued_by_id)
             if not requests_this_round:
@@ -951,7 +1017,8 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 candidate_buffer.clear()
                 if stop:
                     break
-            if requests_made < page_budget and last_job_list:
+            active_queries = query_keywords - exhausted_queries - failed_queries - repeated_queries
+            if requests_made < page_budget and last_job_list and active_queries:
                 self._human_navigate_interlude(last_job_list)
 
         if candidate_buffer and (not target or processed < target):
@@ -960,24 +1027,42 @@ class AutoDeliverer(BossDP, ResultRecorder):
             )
 
         if target and processed < target:
-            exhausted = query_keywords.issubset(exhausted_queries)
-            reason = (
-                f"已达每日投递上限 {self.cfg['daily_limit']}"
-                if not self.tracker.can_deliver(self.cfg["daily_limit"])
-                else "已无更多岗位" if exhausted
-                else "搜索请求存在失败" if failed_queries
-                else f"已达到搜索请求安全上限 {page_budget}"
-            )
+            if not self.tracker.can_deliver(self.cfg["daily_limit"]):
+                reason = f"已达每日投递上限 {self.cfg['daily_limit']}"
+            elif query_keywords.issubset(exhausted_queries):
+                reason = "已无更多岗位"
+            elif failed_queries:
+                reason = "搜索请求存在失败"
+            elif query_keywords.issubset(exhausted_queries | repeated_queries):
+                reason = "所有查询已结束（空页或重复页）"
+            else:
+                reason = f"已达到搜索请求安全上限 {page_budget}"
             print(f"[采集] {reason}，本轮 AI 评估 {processed}/{target} 个岗位")
         elif target:
             print(f"[本轮] 已完成 AI 评估 {processed}/{target} 个岗位")
+        for keyword, stats in self.search_query_stats.items():
+            if not stats["stop_reason"]:
+                stats["stop_reason"] = (
+                    "达到评估目标" if target and processed >= target
+                    else "每日投递上限" if not self.tracker.can_deliver(self.cfg["daily_limit"])
+                    else "请求预算用尽"
+                )
+            print(
+                f"[搜索统计] {keyword or '平台推荐'} | 请求 {stats['requests']}"
+                f" | 列表条目 {stats['listed']} | 词内唯一岗位 {stats['unique_listed']}"
+                f" | 首次入队 {stats['new_candidates']} | {stats['stop_reason']}"
+            )
 
     def _process_profiled_jobs(self, candidate_queue, processed):
         if not candidate_queue:
             return processed, False
+        target_city = city_name(self.cfg) if str(self.cfg.get("city_code") or "").strip() else ""
         prioritized_jobs = self._prioritize_jobs_by_type(candidate_queue)
-        # 范围排序：标题即可确认 in_scope 的岗位优先处理；
-        # scope_review 靠后，预算不足时被自然截断（省下 AI 调用给确认范围内的岗位）
+        allocations = self.matching_context.get("allocations", [])
+        recommendation_mode = bool(allocations) and not any(
+            str(item.get("keyword") or "").strip() for item in allocations
+        )
+        # 推荐流中，范围未确认的岗位留待人工复核，不占用 AI 评估名额。
         def _scope_rank(job):
             status, _reason = classify_job_scope(
                 job, self.matching_context["candidate"]
@@ -987,6 +1072,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
         print(f"[合并] 本批唯一岗位 {len(prioritized_jobs)}，评分画像 "
               f"{len(self.matching_context['profiles'])} 个")
         for index, job in enumerate(prioritized_jobs, 1):
+            self._raise_if_platform_stopped()
             if self.cfg["test_limit"] and processed >= self.cfg["test_limit"]:
                 print(f"[本轮] 已达到处理岗位数 {self.cfg['test_limit']}，停止")
                 return processed, True
@@ -1001,6 +1087,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
             )
             job["职业范围状态"] = scope_status
             if scope_status == "out_of_scope":
+                print(f"  [范围过滤] {job['工作名称']}：{scope_reason}，跳过 AI 评分")
                 self._count_stage("out_of_scope")
                 self._record(self._result_row(
                     job, "", scope_reason, scope_status,
@@ -1009,7 +1096,19 @@ class AutoDeliverer(BossDP, ResultRecorder):
                 if self.cfg["test_limit"] and processed >= self.cfg["test_limit"]:
                     return processed, True
                 continue
-            # scope_review 不再直接跳过：进 AI 评分，但阈值加罚、排序靠后
+            if scope_status == "scope_review" and recommendation_mode:
+                self._count_stage("scope_review")
+                print(
+                    f"  [范围待复核] {job['工作名称']}：{scope_reason}，"
+                    "推荐模式跳过 AI 评分"
+                )
+                self._record(self._result_row(
+                    job, "", scope_reason, "scope_review",
+                    filter_reason=scope_reason,
+                ))
+                continue
+
+            # Keyword-targeted searches may score ambiguous roles with a higher threshold.
             review_penalty = (
                 int(self.cfg.get("scope_review_penalty", 0) or 0)
                 if scope_status == "scope_review" else 0
@@ -1034,6 +1133,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
             print(f"\n[岗位 {index}/{len(prioritized_jobs)} | 本轮第{processed}个] "
                   f"{job.get('工作性质', '待确认')} | {name} | {job.get('公司', '')}")
 
+            self._raise_if_platform_stopped()
             self._count_stage("ai_called")
             if scope_status == "scope_review":
                 self._count_stage("scope_review_ai_called")
@@ -1046,11 +1146,13 @@ class AutoDeliverer(BossDP, ResultRecorder):
                     job=job,
                     profiles=scored_profiles,
                     rules=self.matching_context["rules"],
+                    target_city=target_city,
                 )
             except Exception as exc:
                 response = None
                 print(f"  [AI] 多画像评分失败: {exc}")
             if not response and len(scored_profiles) > 1:
+                self._raise_if_platform_stopped()
                 # 失败降级：只评 1 个最优画像（来源画像优先），降 token、提成功率
                 self._count_stage("ai_retry_single_profile")
                 fallback = next(
@@ -1068,6 +1170,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
                         job=job,
                         profiles=scored_profiles,
                         rules=self.matching_context["rules"],
+                        target_city=target_city,
                     )
                 except Exception as exc:
                     response = None
@@ -1141,6 +1244,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
                     return processed, True
                 continue
 
+            self._raise_if_platform_stopped()
             greeting = self.ai.gen_greeting(
                 self.resume_text, job,
                 candidate_profile=self.matching_context["candidate"],
@@ -1176,8 +1280,10 @@ class AutoDeliverer(BossDP, ResultRecorder):
             self._record(self._result_row(
                 job, primary.score, primary.reason, status,
                 "" if status == "already_contacted" else greeting,
-                filter_reason=("平台显示「继续沟通」，本轮未发送招呼语"
-                               if status == "already_contacted" else ""),
+                filter_reason=("平台显示已处理，本轮未重复投递"
+                               if status == "already_contacted" else
+                               "未识别到已适配的申请控件，请打开官方岗位页投递"
+                               if status == "manual_required" else ""),
                 match_data=match_data,
             ))
             if status == "delivered":
@@ -1194,7 +1300,10 @@ class AutoDeliverer(BossDP, ResultRecorder):
                         count_delivery=False,
                     )
                 else:
-                    self.tracker.mark(job["encryptJobId"], name, greeting, status)
+                    self.tracker.mark(
+                        job["encryptJobId"], name, greeting, status,
+                        count_delivery=status != "manual_required",
+                    )
             time.sleep(random.uniform(*self.cfg["job_delay"]))
             if self.cfg["test_limit"] and processed >= self.cfg["test_limit"]:
                 return processed, True
@@ -1218,6 +1327,7 @@ class AutoDeliverer(BossDP, ResultRecorder):
 
             if getattr(self, "profile_mode", False):
                 self._run_profiled_pipeline()
+                self._raise_if_platform_stopped()
                 return
 
             # Collect the configured pages first so target job types can be prioritized across pages.
@@ -1412,7 +1522,10 @@ class AutoDeliverer(BossDP, ResultRecorder):
                             count_delivery=False,
                         )
                     else:
-                        self.tracker.mark(job["encryptJobId"], name, greeting, status)
+                        self.tracker.mark(
+                            job["encryptJobId"], name, greeting, status,
+                            count_delivery=status != "manual_required",
+                        )
 
                 # 4. 岗位间隔 + 可选拟人穿插浏览
                 time.sleep(random.uniform(*self.cfg["job_delay"]))
@@ -1420,6 +1533,9 @@ class AutoDeliverer(BossDP, ResultRecorder):
         except KeyboardInterrupt:
             print("\n用户中断")
             exit_code = 130
+        except PlatformAccessStopped as exc:
+            print(f"[平台限制] {exc}")
+            exit_code = 3
         except Exception as exc:
             print(f"程序异常: {exc}")
             import traceback
@@ -1440,13 +1556,6 @@ class AutoDeliverer(BossDP, ResultRecorder):
 
 
 if __name__ == "__main__":
-    try:
-        matching_context = load_matching_config(DELIVER_CONFIG)
-        apply_search_settings(DELIVER_CONFIG, SpiderConfig)
-    except (OSError, ValueError) as exc:
-        print(f"[配置错误] {exc}")
-        raise SystemExit(2)
-    SpiderConfig["keyword"] = matching_context["allocations"][0]["keyword"]
-    SpiderConfig["start_url"] = build_job_search_url(SpiderConfig)
-    deliverer = AutoDeliverer(DELIVER_CONFIG, matching_context=matching_context)
-    raise SystemExit(deliverer.run())
+    from platform_worker import run_platforms
+
+    raise SystemExit(run_platforms(DELIVER_CONFIG))

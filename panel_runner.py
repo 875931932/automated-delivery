@@ -12,6 +12,7 @@ from dotenv import dotenv_values
 
 from app_paths import get_app_dir, get_data_dir, is_frozen
 from process_runtime import quiet_process_options, worker_python
+from result_browser import ensure_task_profiles_available
 
 BASE_DIR = get_data_dir()
 APP_DIR = get_app_dir()
@@ -24,6 +25,8 @@ def format_exit_status(exit_code, manually_stopped=False) -> str:
         return f"任务已手动停止（退出码 {exit_code}）"
     if exit_code == 0:
         return "任务正常结束（退出码 0）"
+    if exit_code == 3:
+        return "平台限制，任务已停止，请查看日志（退出码 3）"
     if exit_code == 130:
         return "任务被中断（退出码 130）"
     return f"任务运行失败（退出码 {exit_code}）"
@@ -56,6 +59,10 @@ class TaskRunner:
             key: value for key, value in env_values.items()
             if key and value is not None
         })
+        try:
+            ensure_task_profiles_available(env)
+        except ValueError as exc:
+            return str(exc)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
         self.log_queue = queue.Queue()

@@ -17,6 +17,7 @@ from job_profiles import (
     allocate_query_pages,
     build_unique_queries,
     load_screening_rules,
+    parse_search_keywords,
 )
 
 from platform_search_filters import (
@@ -70,6 +71,10 @@ DELIVER_CONFIG = {
     "tavily_timeout": _env_int("TAVILY_TIMEOUT", 12),
 
     # --- 简历与筛选 ---
+    "platforms": _env_str("JOB_PLATFORMS", "boss"),
+    "city_code": _env_str("CITY_CODE", "101280600"),
+    "zhilian_city_code": _env_str("ZHILIAN_CITY_CODE", ""),
+    "liepin_city_code": _env_str("LIEPIN_CITY_CODE", ""),
     "resume_file": _env_str("RESUME_FILE", "resume.md"),
     "match_threshold": _env_int("MATCH_THRESHOLD", 70),    # AI 匹配分数 >= 该值才投递
     # 列表阶段经验门槛分级：下限 >= hard 直接拦截；soft~hard 之间放行交给 AI 评分兜底
@@ -81,7 +86,7 @@ DELIVER_CONFIG = {
     "role_reject_shadow": os.getenv("ROLE_REJECT_SHADOW", "true").strip().lower() == "true",
     # 本地廉价 gate 影子模式：hard_conflict 只记录不拦截（误杀率 <5% 后可关闭影子）
     "local_gate_shadow": os.getenv("LOCAL_GATE_SHADOW", "true").strip().lower() == "true",
-    "deliver_keyword": _env_str("DELIVER_KEYWORD", "AI应用开发"),
+    "deliver_keyword": _env_str("DELIVER_KEYWORD", ""),
     "deliver_max_pages": min(50, max(1, _env_int("DELIVER_MAX_PAGES", 10))),  # 每轮搜索请求总上限
     "candidate_profile_file": _env_str("CANDIDATE_PROFILE_FILE", "candidate_profile.json"),
     "job_profiles_file": _env_str("JOB_PROFILES_FILE", "job_profiles.json"),
@@ -143,7 +148,8 @@ DELIVER_CONFIG = {
 def apply_search_settings(config, spider_config):
     """Apply job-search settings shared by API requests and browser navigation."""
     spider_config["city_id"] = _env_str("CITY_CODE", "101280600")
-    spider_config["keyword"] = config["deliver_keyword"]
+    keywords = parse_search_keywords(config.get("deliver_keyword", ""))
+    spider_config["keyword"] = keywords[0] if keywords else ""
     spider_config["keep_login"] = config["keep_login"]
     spider_config["browser_background"] = config.get("browser_background", True)
     spider_config["start_url"] = configure_platform_search(config, spider_config)
@@ -183,7 +189,8 @@ def load_matching_config(config: dict):
     运行模式说明
     ─────────────────────────────────────────────────────────────────
     基础模式（无需任何额外配置，开箱即用）
-      必须：.env 中填写 AI_API_KEY、RESUME_FILE、DELIVER_KEYWORD
+      必须：.env 中填写 AI_API_KEY、RESUME_FILE
+      可选：DELIVER_KEYWORD；留空时从平台推荐岗位中筛选
       可选：resume_digest.json（首次运行自动生成，加速后续评分）
       不需要：candidate_profile.json、job_profiles.json 自定义、TAVILY_API_KEY
 
@@ -208,30 +215,33 @@ def load_matching_config(config: dict):
     enhanced_profile_stale = False
 
     target = str(config.get("deliver_keyword", "") or "").strip()
-    if not target:
-        raise ValueError("请先在「求职设置」填写目标岗位（例如：AI 应用工程师）。")
+    search_keywords = parse_search_keywords(target)
 
     job_store = JobProfileStore(local_path("job_profiles_file", "job_profiles.json"))
     stored = job_store.load_or_migrate(target)
     enabled_stored = [item for item in stored if item.enabled]
     if enabled_stored:
-        # 旧数据兼容：保留已有评分标尺（硬要求/加分/阈值），
-        # 但搜索词完全由「目标岗位」决定，避免旧关键词污染检索范围。
-        profiles = [
-            item.model_copy(update={"search_keywords": [target]})
-            for item in enabled_stored
-        ]
+        if target:
+            # 搜索词由面板目标决定，避免旧画像关键词污染检索范围。
+            profiles = [
+                item.model_copy(update={"search_keywords": search_keywords})
+                for item in enabled_stored
+            ]
+        else:
+            profiles = enabled_stored
     else:
-        # 岗位画像不再由用户手工维护：按「目标岗位」自动派生一条，零配置即可启动。
-        # 硬要求/阈值留空，AI 评分只依据 JD 正文与简历。
+        # 无目标词时建立无检索词画像，仍由简历与 JD 完成匹配评分。
         profiles = [JobProfile(
-            id="auto-target",
-            name=target,
+            id="auto-target" if target else "auto-recommended",
+            name=target or "平台推荐岗位",
             role_family_id="",
             role_direction=target,
-            search_keywords=[target],
+            search_keywords=search_keywords,
         )]
-        print(f"[配置] 按目标岗位自动生成岗位画像：{target}")
+        if target:
+            print(f"[配置] 按目标岗位自动生成岗位画像：{target}")
+        else:
+            print("[配置] 搜索关键词为空，将从平台推荐岗位中筛选")
 
     base_mode = False
     resume_text = None
@@ -265,7 +275,9 @@ def load_matching_config(config: dict):
         # 不应传染到范围匹配：否则 title_terms 只剩 [target] 一个词，
         # 大模型应用工程师、LLM应用开发等明显相关岗位全落入 scope_review）
         candidate = build_base_candidate_profile(
-            resume_text, enabled_stored or profiles, config.get("deliver_keyword", ""),
+            resume_text,
+            enabled_stored or profiles,
+            target or "按简历匹配推荐岗位",
         )
         print("[配置] 未找到已确认候选人画像，已用基础画像（简历摘要+岗位画像关键词）启动")
 
@@ -273,7 +285,11 @@ def load_matching_config(config: dict):
     active_profiles = [item for item in profiles if item.enabled]
     if not active_profiles:
         raise ValueError("没有可用的岗位方向，请检查「求职设置」里的目标岗位。")
-    queries = build_unique_queries(active_profiles)
+    queries = (
+        build_unique_queries(active_profiles)
+        if target
+        else [{"keyword": "", "profile_ids": [item.id for item in active_profiles]}]
+    )
     target = max(0, int(config.get("test_limit", 0) or 0))
     allocations = allocate_query_pages(queries, len(queries))
     if len(queries) > 50:
@@ -303,7 +319,7 @@ def load_matching_config(config: dict):
 
 
 if not DELIVER_CONFIG["ai_api_key"] or "你的key" in DELIVER_CONFIG["ai_api_key"]:
-    print("[配置] ⚠️ 尚未在 .env 中填写 AI_API_KEY，AI 匹配将无法工作")
+    print("[配置] 警告：尚未在 .env 中填写 AI_API_KEY，AI 匹配将无法工作")
 
 RESULT_FIELDS = [
     "encryptJobId", "工作名称", "公司", "工资", "区域", "上班时间", "休息制度",
@@ -312,5 +328,5 @@ RESULT_FIELDS = [
     "硬性缺口", "未验证要求", "加分项命中", "加分项缺口", "简历证据", "打招呼语",
     "投递状态", "投递时间", "详情链接", "筛选原因", "人工标记",
     "主岗位画像", "岗位画像评估详情", "职业范围状态",
-    "搜索来源关键词", "来源岗位画像",
+    "搜索来源关键词", "来源岗位画像", "平台", "平台岗位ID",
 ]

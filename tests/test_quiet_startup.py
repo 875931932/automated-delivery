@@ -42,6 +42,7 @@ class QuietProcessTests(unittest.TestCase):
             with patch.object(panel_runner, 'BASE_DIR', root), \
                     patch.object(panel_runner.sys, 'executable', str(root / 'pythonw.exe')), \
                     patch.object(panel_runner, 'is_frozen', return_value=False), \
+                    patch.object(panel_runner, 'ensure_task_profiles_available'), \
                     patch.object(panel_runner.subprocess, 'Popen', return_value=process) as popen, \
                     patch.object(panel_runner.threading, 'Thread'):
                 panel_runner.TaskRunner().start()

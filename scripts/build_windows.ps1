@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Push-Location $root
 try {
+    $metadata = Get-Content -LiteralPath (Join-Path $root 'author_info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $version = $metadata.version
     if (-not $SkipTests) {
         $oldQtPlatform = $env:QT_QPA_PLATFORM
         $env:QT_QPA_PLATFORM = 'offscreen'
@@ -38,8 +40,8 @@ try {
     if (-not $Iscc) { throw 'Inno Setup compiler not found. Pass -Iscc with the ISCC.exe path.' }
     & $Iscc packaging/installer.iss
     if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
-    $setup = Join-Path $root 'release\AutoDeliver-Setup-1.0.0-win64.exe'
-    $zip = Join-Path $root 'release\AutoDeliver-1.0.0-win64-portable.zip'
+    $setup = Join-Path $root ("release\AutoDeliver-Setup-{0}-win64.exe" -f $version)
+    $zip = Join-Path $root ("release\AutoDeliver-{0}-win64-portable.zip" -f $version)
     Compress-Archive -LiteralPath (Join-Path $root 'dist\AutoDeliver') -DestinationPath $zip -Force
     Get-FileHash -LiteralPath $setup, $zip -Algorithm SHA256 | Format-Table -AutoSize
 } finally { Pop-Location }

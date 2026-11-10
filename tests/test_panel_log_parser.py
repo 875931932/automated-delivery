@@ -62,6 +62,7 @@ class ClassifyLogLineTests(unittest.TestCase):
             "程序异常: connection reset",
             "[配置错误] 缺少 API key",
             "  [投递] 发送失败: element not found",
+            "[平台限制] 接口返回 HTTP 429；本轮已停止。",
         ):
             self.assertEqual(classify_log_line(line), CATEGORY_ERROR, line)
 

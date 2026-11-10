@@ -20,8 +20,9 @@ ROLE_RULES = (
      r"授课|讲授|备课|课程教学|企业培训|企业授课|外部授课|课程体系|成熟课程|培训课程"),
     ("岗位职能偏销售商务", r"销售|商务拓展|客户经理|销售顾问|渠道拓展|BD",
      r"开发客户|拓展客户|销售产品|商务谈判|销售业绩|电话销售|签约回款|客户拜访"),
-    ("岗位职能偏运营", r"运营|新媒体|内容编辑",
-     r"内容策划|活动策划|社群维护|用户增长|账号运营|内容发布|活动执行"),
+    ("岗位职能偏运营", r"运营|新媒体|内容编辑|履约专员|履约助理",
+     r"内容策划|活动策划|社群维护|用户增长|账号运营|内容发布|活动执行|"
+     r"电商平台运营|商品分类维护|商品上架|订单履约|客户履约|客诉督办"),
     ("岗位职能偏客服支持", r"客服|客户服务|售后|电话回访",
      r"客户咨询|售后处理|工单处理|投诉处理|客户回访"),
     ("岗位职能偏招聘人事", r"招聘|人力资源|人事专员|HR",
@@ -81,8 +82,25 @@ def _primary_duty_text(job: dict) -> str:
     return " ".join([title, *selected])
 
 
+def _is_development_family(family) -> bool:
+    terms = [family.name, *family.aliases, *family.title_terms]
+    # Mixed/unknown career scopes must not inherit the development-only rules.
+    if any(re.search(
+        r"运营|销售|商务|客户经理|客户服务|客服|产品经理|招聘|人事|培训|讲师|教师|履约",
+        term, re.IGNORECASE,
+    ) for term in terms):
+        return False
+    return any(re.search(
+        r"(?:软件|应用|后端|前端|全栈|算法|机器人|智能体|嵌入式|客户端|"
+        r"移动端|大模型|python|java|c\+\+|golang|web|android|ios|ai|llm|agent)"
+        r"\s*(?:应用|软件|服务)?\s*(?:开发|研发|工程师)|程序员|"
+        r"\b(?:software|backend|frontend|fullstack)\s+(?:developer|engineer)\b",
+        _normalize_scope_text(term), re.IGNORECASE,
+    ) for term in terms)
+
+
 def classify_job_scope(job: dict, candidate: CandidateProfile) -> tuple[str, str]:
-    """Classify only from confirmed scope terms and title/primary-duty clauses."""
+    """Match confirmed scope, then reject clearly incompatible job functions."""
     text = _primary_duty_text(job)
     title = str(job.get("工作名称", job.get("jobName", "")) or "")
     excluded_hits = [
@@ -105,6 +123,16 @@ def classify_job_scope(job: dict, candidate: CandidateProfile) -> tuple[str, str
         )]
         if matched:
             return "in_scope", f"命中已确认职位族「{family.name}」：{', '.join(matched)}"
+    if candidate.confirmed and candidate.allowed_role_families and all(
+        _is_development_family(family) for family in candidate.allowed_role_families
+    ):
+        reason = role_function_reject({
+            "工作名称": title,
+            "工作介绍": job.get("工作介绍", job.get("jobDescription", "")),
+        })
+        if reason:
+            targets = "、".join(family.name for family in candidate.allowed_role_families)
+            return "out_of_scope", f"{reason}，与目标职位族「{targets}」不符"
     return "scope_review", "标题与主要职责无法明确映射到已确认职位族，需复核职业范围"
 
 
@@ -765,21 +793,30 @@ def role_function_reject(job_data):
     development_action = (
         r"开发|研发|搭建|构建|实现|迭代|编码|联调|部署|上线|维护|修复|优化"
     )
+    # Do not join platform operations to merchandise/customer maintenance and
+    # mistake them for software work. Keep genuine system/API maintenance intact.
+    duties_for_check = re.sub(
+        r"(?:电商|业务)?平台运营(?:维护)?|商品分类维护|"
+        r"(?:维护|优化)(?:商品分类|商品信息|客户关系)|"
+        r"(?:商品信息|客户关系)(?:维护|优化)",
+        "", duties_for_check,
+    )
+    engineering_gap = r"[^，,、。；;！？\n]{0,10}"
     development_duties = any(
         re.search(
             rf"(?:{engineering_action}).{{0,10}}(?:{development_action})"
-            rf".{{0,10}}(?:{engineering_artifact})",
+            rf"{engineering_gap}(?:{engineering_artifact})",
             clause,
             re.IGNORECASE,
         )
         or re.search(
             rf"(?:{engineering_action}).{{0,10}}(?:{engineering_artifact})"
-            rf".{{0,10}}(?:{development_action})",
+            rf"{engineering_gap}(?:{development_action})",
             clause,
             re.IGNORECASE,
         )
         or re.search(
-            rf"(?:维护|修复|优化).{{0,10}}(?:{engineering_artifact})",
+            rf"(?:维护|修复|优化){engineering_gap}(?:{engineering_artifact})",
             clause,
             re.IGNORECASE,
         )
@@ -792,9 +829,15 @@ def role_function_reject(job_data):
     if development_duties:
         return None
 
+    # Company introductions and explicitly negated tasks are not role duties.
+    role_duties = "。".join(
+        re.sub(r"(?:不负责|不涉及|无需|不承担|不需要)[^，,]*", "", clause)
+        for clause in re.split(r"[。；;！？\n]", duties)
+        if not re.match(r"\s*公司|\s*团队", clause)
+    )
     for reason, title_pattern, duties_pattern in ROLE_RULES:
         if re.search(title_pattern, title, re.IGNORECASE) and re.search(
-            duties_pattern, duties_for_check, re.IGNORECASE
+            duties_pattern, role_duties, re.IGNORECASE
         ):
             return reason
     return None

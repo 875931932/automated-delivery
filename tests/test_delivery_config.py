@@ -16,6 +16,9 @@ import platform_locations
 class DeliveryConfigTransmissionTests(unittest.TestCase):
     def test_saved_environment_values_reach_runtime_configuration(self):
         values = {
+            "JOB_PLATFORMS": "BOSS 直聘,智联招聘,猎聘",
+            "ZHILIAN_CITY_CODE": "489",
+            "LIEPIN_CITY_CODE": "050090",
             "AI_BASE_URL": "https://model.example/v1",
             "AI_API_KEY": "test-model-key",
             "AI_MODEL": "test-model",
@@ -61,6 +64,10 @@ class DeliveryConfigTransmissionTests(unittest.TestCase):
             "BROWSER_BACKGROUND": "false",
         }
         expected = {
+            "platforms": values["JOB_PLATFORMS"],
+            "city_code": values["CITY_CODE"],
+            "zhilian_city_code": values["ZHILIAN_CITY_CODE"],
+            "liepin_city_code": values["LIEPIN_CITY_CODE"],
             "ai_base_url": values["AI_BASE_URL"],
             "ai_api_key": values["AI_API_KEY"],
             "ai_model": values["AI_MODEL"],

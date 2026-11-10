@@ -10,6 +10,23 @@ import panel_runner
 
 
 class TaskRunnerEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        browser_guard = patch.object(panel_runner, "ensure_task_profiles_available")
+        browser_guard.start()
+        self.addCleanup(browser_guard.stop)
+
+    def test_open_project_browser_blocks_worker_start_without_killing_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(panel_runner, "BASE_DIR", Path(temp_dir)), \
+                    patch.object(panel_runner, "ensure_task_profiles_available",
+                                 side_effect=ValueError("请先关闭项目浏览器窗口")), \
+                    patch.object(panel_runner.subprocess, "Popen") as popen, \
+                    patch.object(panel_runner.subprocess, "run") as run:
+                message = panel_runner.TaskRunner().start()
+            self.assertIn("请先关闭", message)
+            popen.assert_not_called()
+            run.assert_not_called()
+
     def test_source_start_uses_source_script_and_user_data_as_working_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -42,6 +59,7 @@ class TaskRunnerEnvironmentTests(unittest.TestCase):
             escaped_prompt = prompt.replace("\\", "\\\\").replace("'", "\\'")
             (base_dir / ".env").write_text(
                 'AI_TIMEOUT=45\nAI_API_KEY="panel-key"\n'
+                'DELIVER_KEYWORD=\n'
                 f"GREETING_PROMPT='{escaped_prompt}'\n",
                 encoding="utf-8",
             )
@@ -50,6 +68,7 @@ class TaskRunnerEnvironmentTests(unittest.TestCase):
                     patch.dict(os.environ, {
                         "AI_TIMEOUT": "999",
                         "AI_API_KEY": "stale-parent-key",
+                        "DELIVER_KEYWORD": "stale-parent-keyword",
                         "INJECTED_SECRET": "preserved",
                     }), \
                     patch.object(panel_runner.subprocess, "Popen", return_value=process) as popen, \
@@ -60,6 +79,7 @@ class TaskRunnerEnvironmentTests(unittest.TestCase):
         child_env = popen.call_args.kwargs["env"]
         self.assertEqual(child_env["AI_TIMEOUT"], "45")
         self.assertEqual(child_env["AI_API_KEY"], "panel-key")
+        self.assertEqual(child_env["DELIVER_KEYWORD"], "")
         self.assertEqual(child_env["GREETING_PROMPT"], prompt)
         self.assertEqual(child_env["INJECTED_SECRET"], "preserved")
 
@@ -136,6 +156,7 @@ class TaskRunnerEnvironmentTests(unittest.TestCase):
         self.assertEqual(panel_runner.format_exit_status(None), "空闲")
         self.assertIn("正常结束", panel_runner.format_exit_status(0))
         self.assertIn("运行失败", panel_runner.format_exit_status(2))
+        self.assertIn("平台限制", panel_runner.format_exit_status(3))
         self.assertIn("被中断", panel_runner.format_exit_status(130))
         self.assertIn("手动停止", panel_runner.format_exit_status(1, True))
 

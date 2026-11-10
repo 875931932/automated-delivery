@@ -5,8 +5,8 @@ import json
 import time
 from functools import lru_cache
 
-from PySide6.QtCore import QSize, Qt, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -30,17 +31,25 @@ from PySide6.QtWidgets import (
 )
 
 from panel_result_logic import (
+    delete_result_rows,
     deduplicate_result_rows,
     filter_result_rows,
+    read_result_snapshot,
     row_score,
     status_display,
     summarize_result_rows,
     update_result_mark,
 )
 from panel_widgets import SideDrawer, pad_spinbox_text
+from job_platforms import PLATFORM_LABELS
+from result_browser import open_result_job, result_job_target
 
 SCORE_ROLE = Qt.UserRole       # 数字分数（排序用）
 ROW_ROLE = Qt.UserRole + 1     # 对应 self.result_rows 下标
+LINK_COLUMN = 9
+CHECK_COLUMN = 10
+DELETE_COLUMN = 11
+RESULT_PAGE_SIZE = 200
 
 
 @lru_cache(maxsize=64)
@@ -182,7 +191,7 @@ class ResultPageMixin:
         filter_layout.addWidget(self.result_status_filter)
 
         self.result_search = QLineEdit()
-        self.result_search.setPlaceholderText("搜索岗位名称或公司")
+        self.result_search.setPlaceholderText("搜索岗位、公司或平台")
         self.result_search.setClearButtonEnabled(True)
         self.result_search.textChanged.connect(self._apply_result_filter)
         filter_layout.addWidget(self.result_search, 1)
@@ -228,7 +237,7 @@ class ResultPageMixin:
         self.result_score_max.valueChanged.connect(self._apply_result_filter)
         advanced_layout.addWidget(self.result_score_max)
         self.result_review_only = QCheckBox("只看待复核")
-        self.result_review_only.setToolTip("只看职业范围状态为 scope_review 的记录")
+        self.result_review_only.setToolTip("查看范围待复核、投递待核对和需人工投递的记录")
         self.result_review_only.setCursor(Qt.PointingHandCursor)
         self.result_review_only.toggled.connect(self._apply_result_filter)
         advanced_layout.addWidget(self.result_review_only)
@@ -243,6 +252,23 @@ class ResultPageMixin:
         table_head_layout.setContentsMargins(20, 14, 20, 14)
         table_head_layout.setSpacing(8)
         table_head_layout.addWidget(self._label("投递记录", "section"))
+        self.result_checked_rows = set()
+        self.result_select_page = QCheckBox("全选本页")
+        self.result_select_page.setToolTip("勾选当前筛选结果的本页记录；切换筛选或翻页后清空勾选")
+        self.result_select_page.clicked.connect(self._select_result_page)
+        table_head_layout.addWidget(self.result_select_page)
+        self.result_selection_count = self._label("已选 0 项", "muted")
+        table_head_layout.addWidget(self.result_selection_count)
+        self.result_clear_selection = QPushButton("取消选择")
+        self.result_clear_selection.setObjectName("soft")
+        self.result_clear_selection.clicked.connect(lambda: self._select_result_page(False))
+        table_head_layout.addWidget(self.result_clear_selection)
+        self.result_delete_selected = QPushButton("删除所选")
+        self.result_delete_selected.setObjectName("soft")
+        self.result_delete_selected.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        self.result_delete_selected.setToolTip("删除勾选岗位的本地结果历史，删除前自动备份")
+        self.result_delete_selected.clicked.connect(self._delete_selected_results)
+        table_head_layout.addWidget(self.result_delete_selected)
         table_head_layout.addStretch(1)
         view_detail = QPushButton("查看详情")
         view_detail.setObjectName("soft")
@@ -254,10 +280,10 @@ class ResultPageMixin:
         table_head_layout.addWidget(view_detail)
         table_layout.addWidget(table_head)
         table_layout.addWidget(self._divider("divider"))
-        self.result_table = QTableWidget(0, 8)
+        self.result_table = QTableWidget(0, 12)
         self.result_table.setHorizontalHeaderLabels([
             "工作名称", "公司", "工资", "区域", "AI匹配分数",
-            "投递状态", "投递时间", "范围状态",
+            "投递状态", "投递时间", "范围状态", "平台", "岗位链接", "选择", "删除",
         ])
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.verticalHeader().setDefaultSectionSize(40)
@@ -270,9 +296,17 @@ class ResultPageMixin:
         self.result_table.setSortingEnabled(True)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
-        for index, width in enumerate([220, 160, 100, 110, 110, 130, 155, 100]):
+        header.setStretchLastSection(False)
+        for index, width in enumerate([220, 160, 100, 110, 110, 130, 155, 100, 100]):
             self.result_table.setColumnWidth(index, width)
+        header.moveSection(8, 0)
+        header.moveSection(header.visualIndex(LINK_COLUMN), 2)
+        header.setSectionResizeMode(LINK_COLUMN, QHeaderView.ResizeMode.Fixed)
+        self.result_table.setColumnWidth(LINK_COLUMN, 82)
+        header.moveSection(header.visualIndex(CHECK_COLUMN), 0)
+        for column, width in ((CHECK_COLUMN, 52), (DELETE_COLUMN, 58)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            self.result_table.setColumnWidth(column, width)
         self.result_table.itemSelectionChanged.connect(self._show_selected_result)
         self.result_table.itemDoubleClicked.connect(
             lambda _item: self._open_result_drawer()
@@ -286,6 +320,21 @@ class ResultPageMixin:
         self.result_empty_hint.setAlignment(Qt.AlignCenter)
         self.result_empty_hint.setVisible(False)
         table_layout.addWidget(self.result_empty_hint, 1)
+        self.result_page_index = 0
+        self.result_filtered_rows = []
+        pager = QWidget()
+        pager_layout = QHBoxLayout(pager)
+        pager_layout.setContentsMargins(20, 8, 20, 8)
+        self.result_page_label = self._label("第 0 / 0 页", "muted")
+        pager_layout.addWidget(self.result_page_label)
+        pager_layout.addStretch(1)
+        self.result_previous_page = QPushButton("上一页")
+        self.result_next_page = QPushButton("下一页")
+        for button, delta in ((self.result_previous_page, -1), (self.result_next_page, 1)):
+            button.setObjectName("soft")
+            button.clicked.connect(lambda _checked=False, step=delta: self._change_result_page(step))
+            pager_layout.addWidget(button)
+        table_layout.addWidget(pager)
         layout.addWidget(table_card, 1)
 
         # —— 岗位详情抽屉 ——
@@ -569,13 +618,15 @@ class ResultPageMixin:
             open_link.setIcon(_result_icon("link", "#2F5BEA"))
             open_link.setIconSize(QSize(15, 15))
             open_link.setCursor(Qt.PointingHandCursor)
+            open_link.setToolTip("使用该平台的项目浏览器和登录信息打开")
             open_link.clicked.connect(
-                lambda _checked=False, target=QUrl(link): QDesktopServices.openUrl(target)
+                lambda _checked=False, target=dict(row): self._open_result_job(target)
             )
             link_layout.addWidget(open_link, 0, Qt.AlignLeft)
 
         info = []
         for key, label in (
+            ("平台", "招聘平台"),
             ("encryptJobId", "岗位 ID"), ("工作性质", "工作性质"),
             ("区域", "工作地点"), ("上班时间", "上班时间"),
             ("休息制度", "休息制度"), ("主岗位画像", "主岗位画像"),
@@ -602,6 +653,17 @@ class ResultPageMixin:
 
         self.result_detail_layout.addStretch(1)
         self._populate_result_evidence(row)
+
+    def _open_result_job(self, row):
+        if self.runner.running():
+            QMessageBox.information(self, "打开岗位", "投递任务正在使用项目浏览器，请先结束任务，再打开岗位链接。")
+            return
+        try:
+            open_result_job(row, read_env_dict())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法打开岗位", str(exc))
+            return
+        self.statusBar().showMessage("已在项目浏览器中打开岗位", 4000)
 
     def _populate_result_evidence(self, row):
         _clear_layout(self.result_evidence_layout)
@@ -799,6 +861,82 @@ class ResultPageMixin:
         self.append_log(f"[面板] {time.strftime('%H:%M:%S')} 已把 {updated} 条记录（{job_id}）标记为「{mark}」")
         self.refresh_results()
 
+    def _update_result_selection(self):
+        count = len(self.result_checked_rows)
+        total = len(getattr(self, "result_rows", []))
+        self.result_selection_count.setText(f"已选 {count} 项")
+        self.result_clear_selection.setEnabled(count > 0)
+        self.result_delete_selected.setEnabled(count > 0)
+        self.result_select_page.setEnabled(total > 0)
+        self.result_select_page.blockSignals(True)
+        self.result_select_page.setCheckState(
+            Qt.Checked if count and count == total else Qt.PartiallyChecked if count else Qt.Unchecked
+        )
+        self.result_select_page.blockSignals(False)
+
+    def _check_result_row(self, source_index, checked):
+        if checked:
+            self.result_checked_rows.add(source_index)
+        else:
+            self.result_checked_rows.discard(source_index)
+        self._update_result_selection()
+
+    def _select_result_page(self, checked):
+        for index in range(self.result_table.rowCount()):
+            cell = self.result_table.cellWidget(index, CHECK_COLUMN)
+            if cell is not None:
+                checkbox = cell.findChild(QCheckBox)
+                checkbox.blockSignals(True)
+                checkbox.setChecked(bool(checked))
+                checkbox.blockSignals(False)
+        self.result_checked_rows = set(range(len(self.result_rows))) if checked else set()
+        self._update_result_selection()
+
+    def _delete_selected_results(self):
+        self._delete_result_records([
+            dict(self.result_rows[index]) for index in sorted(self.result_checked_rows)
+        ])
+
+    def _delete_result_records(self, rows):
+        if not rows:
+            return
+        if self.runner.running():
+            QMessageBox.information(self, "删除记录", "任务正在写入结果，请先结束任务，再删除记录。")
+            return
+        path = getattr(self, "result_source_path", None)
+        digest = getattr(self, "result_source_digest", None)
+        if path is None or digest is None:
+            QMessageBox.warning(self, "删除记录", "请先刷新结果列表，再选择要删除的记录。")
+            return
+        answer = QMessageBox.question(
+            self, "删除记录",
+            f"确定删除所选 {len(rows)} 项本地记录？\n\n"
+            "有岗位 ID 的记录会同时删除该岗位全部历史，无 ID 的记录只删除所选条目。\n"
+            "删除前会在结果文件旁自动备份。平台上的投递和今日计数保持不变；"
+            "删除历史可能使这些岗位在后续任务中再次被处理。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if self.runner.running():
+            QMessageBox.information(self, "删除记录", "任务已开始写入结果，请先结束任务，再删除记录。")
+            return
+        try:
+            removed, backup = delete_result_rows(path, rows, expected_digest=digest)
+        except (OSError, ValueError, csv.Error) as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        if not removed:
+            QMessageBox.information(self, "删除记录", "未找到所选记录，列表已刷新。")
+        else:
+            self.append_log(
+                f"[面板] {time.strftime('%H:%M:%S')} 已删除 {len(rows)} 项结果"
+                f"（含历史共 {removed} 行），备份：{backup}"
+            )
+            self.statusBar().showMessage(f"已删除 {len(rows)} 项结果（含历史 {removed} 行），已自动备份", 6000)
+        self.result_drawer.close_drawer()
+        self.refresh_results()
+
     def _result_statuses(self, rows):
         statuses = []
         for row in rows:
@@ -809,7 +947,7 @@ class ResultPageMixin:
 
     def _apply_result_filter(self, *_args):
         rows = getattr(self, "result_all_rows", [])
-        shown = filter_result_rows(
+        self.result_filtered_rows = filter_result_rows(
             rows,
             status=self.result_status_filter.currentText(),
             score_min=self.result_score_min.value(),
@@ -817,12 +955,34 @@ class ResultPageMixin:
             keyword=self.result_search.text(),
             review_only=self.result_review_only.isChecked(),
         )
-        self._fill_result_table(shown)
+        self.result_page_index = 0
+        self._render_result_page()
+
+    def _change_result_page(self, delta):
+        page_count = (len(self.result_filtered_rows) + RESULT_PAGE_SIZE - 1) // RESULT_PAGE_SIZE
+        if 0 <= self.result_page_index + delta < page_count:
+            self.result_page_index += delta
+            self._render_result_page()
+
+    def _render_result_page(self):
+        filtered = len(self.result_filtered_rows)
+        page_count = (filtered + RESULT_PAGE_SIZE - 1) // RESULT_PAGE_SIZE
+        start = self.result_page_index * RESULT_PAGE_SIZE
+        self._fill_result_table(self.result_filtered_rows[start:start + RESULT_PAGE_SIZE])
+        self.result_total.setText(
+            f"显示 {start + 1 if filtered else 0}–{start + len(self.result_rows)} / {filtered} 个"
+        )
+        self.result_page_label.setText(
+            f"第 {self.result_page_index + 1 if filtered else 0} / {page_count} 页"
+        )
+        self.result_previous_page.setEnabled(self.result_page_index > 0)
+        self.result_next_page.setEnabled(self.result_page_index + 1 < page_count)
 
     def _fill_result_table(self, shown):
         self._clear_selected_result()
         self.result_table.setSortingEnabled(False)
         self.result_table.setRowCount(0)
+        self.result_checked_rows = set()
         self.result_rows = shown
         self.result_table.setRowCount(len(shown))
         for row_index, r in enumerate(shown):
@@ -832,6 +992,7 @@ class ResultPageMixin:
                 r.get("工作名称", ""), r.get("公司", ""), r.get("工资", ""),
                 r.get("区域", ""), score_text, r.get("投递状态", ""),
                 r.get("投递时间", ""), r.get("职业范围状态", ""),
+                r.get("平台", "BOSS 直聘"),
             ]
             for column, value in enumerate(values):
                 if column == 4:
@@ -850,9 +1011,67 @@ class ResultPageMixin:
                     item.setBackground(QBrush(QColor(bg)))
                     item.setToolTip(f"{r.get('投递状态', '')}（{label}）")
                 self.result_table.setItem(row_index, column, item)
+            link_cell = QWidget()
+            link_layout = QHBoxLayout(link_cell)
+            link_layout.setContentsMargins(0, 0, 0, 0)
+            link_layout.setAlignment(Qt.AlignCenter)
+            open_link = QPushButton()
+            open_link.setObjectName("resultIconButton")
+            open_link.setIcon(_result_icon("link", "#2F5BEA"))
+            open_link.setIconSize(QSize(16, 16))
+            open_link.setFixedSize(30, 30)
+            open_link.setCursor(Qt.PointingHandCursor)
+            open_link.setAccessibleName("打开岗位链接")
+            try:
+                identity = result_job_target(r)
+                open_link.setToolTip(
+                    f"使用{PLATFORM_LABELS[identity.platform]}项目浏览器打开岗位（沿用登录信息）"
+                )
+            except ValueError as exc:
+                open_link.setEnabled(False)
+                open_link.setToolTip(str(exc))
+            open_link.clicked.connect(
+                lambda _checked=False, target=dict(r): self._open_result_job(target)
+            )
+            link_layout.addWidget(open_link)
+            self.result_table.setCellWidget(row_index, LINK_COLUMN, link_cell)
+            check_cell = QWidget()
+            check_layout = QHBoxLayout(check_cell)
+            check_layout.setContentsMargins(0, 0, 0, 0)
+            check_layout.setAlignment(Qt.AlignCenter)
+            checkbox = QCheckBox()
+            checkbox.setAccessibleName(f"选择记录：{r.get('工作名称', '')}")
+            checkbox.setToolTip("勾选此记录用于批量删除")
+            checkbox.toggled.connect(
+                lambda checked, index=row_index: self._check_result_row(index, checked)
+            )
+            check_layout.addWidget(checkbox)
+            self.result_table.setCellWidget(row_index, CHECK_COLUMN, check_cell)
+            delete_cell = QWidget()
+            delete_layout = QHBoxLayout(delete_cell)
+            delete_layout.setContentsMargins(0, 0, 0, 0)
+            delete_layout.setAlignment(Qt.AlignCenter)
+            delete_button = QPushButton()
+            delete_button.setObjectName("resultIconButton")
+            delete_button.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+            delete_button.setIconSize(QSize(16, 16))
+            delete_button.setFixedSize(30, 30)
+            delete_button.setCursor(Qt.PointingHandCursor)
+            delete_button.setAccessibleName("删除记录")
+            delete_button.setToolTip("删除此岗位的本地结果历史")
+            delete_button.clicked.connect(
+                lambda _checked=False, target=dict(r): self._delete_result_records([target])
+            )
+            delete_layout.addWidget(delete_button)
+            self.result_table.setCellWidget(row_index, DELETE_COLUMN, delete_cell)
         self.result_table.setSortingEnabled(True)
         self.result_table.setVisible(bool(shown))
         self.result_empty_hint.setVisible(not shown)
+        self.result_empty_hint.setText(
+            "没有符合当前筛选条件的记录。" if getattr(self, "result_all_rows", [])
+            else "暂无投递记录。完成求职设置后启动任务，结果会显示在这里。"
+        )
+        self._update_result_selection()
         if shown:
             self.result_table.setCurrentCell(0, 0)
             self._show_selected_result()
@@ -860,12 +1079,14 @@ class ResultPageMixin:
     def refresh_results(self):
         path = BASE_DIR / read_env_dict().get("RESULT_FILE", "deliver_results.csv")
         rows = []
+        self.result_source_path = None
+        self.result_source_digest = None
         if path.exists():
             try:
-                with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                    rows = list(csv.DictReader(f))
-            except OSError:
-                pass
+                rows, self.result_source_digest = read_result_snapshot(path)
+                self.result_source_path = path.resolve()
+            except (OSError, ValueError, csv.Error) as exc:
+                self.append_log(f"[面板] 结果文件读取失败：{exc}")
         self.result_all_rows = deduplicate_result_rows(rows[::-1])  # 每个岗位展示最新有效结果
         for key, value in summarize_result_rows(self.result_all_rows).items():
             self.result_summary_values[key].setText(str(value))
@@ -880,14 +1101,6 @@ class ResultPageMixin:
         self.result_status_filter.blockSignals(False)
 
         self._apply_result_filter()
-        filtered = len(self.result_rows)
-        if filtered > 200:
-            self._fill_result_table(self.result_rows[:200])
-        self.result_total.setText(
-            f"显示 {min(filtered, 200)} / {filtered} 个"
-            + (f"（全部 {len(self.result_all_rows)} 个）"
-               if filtered != len(self.result_all_rows) else "")
-        )
 
 
 # 延迟导入：desktop_panel 在共享工具函数定义完成后才导入本模块（避免循环导入）。

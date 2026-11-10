@@ -15,8 +15,9 @@ import html
 from typing import Optional, Dict# 移除前（误匹配）
 import os
 import csv
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from platform_locations import resolve_platform_area_codes
+from job_platforms import platform_profile_dir
 from platform_search_filters import JOB_TYPE_CODES, PLATFORM_FILTER_PARAMS
 
 Config = {
@@ -33,7 +34,7 @@ Config = {
     "industry": "",
     "scale": "",
     "page_size": 30,
-    "max_pages": 10,  # 单次最多 10 页（300 条），上限保护，降低被封风险
+    "max_pages": 10,  # 本地搜索预算，不代表平台允许的访问频率
     "request_timeout": 15,
     "max_retries": 2,
     "heart_time": 60,
@@ -45,7 +46,7 @@ Config = {
     "output_file": "boss_jobs.csv",
     "max_api_requests": 500,  # 单次最大 API 请求数，上限保护
     # BOSS 专用 Chrome profile（独立于主 Chrome，避免污染主浏览器登录态）
-    "chrome_profile_dir": os.path.join(os.path.expanduser("~"), ".boss-zhipin-scraper", "chrome-profile"),
+    "chrome_profile_dir": str(platform_profile_dir("boss")),
     # 登录态保持：true=固定UA+持久profile(重启免登录)；false=随机UA+临时profile(每次需登录)
     "keep_login": True,
     "browser_background": True,
@@ -67,7 +68,9 @@ def build_job_search_url(config):
             params[key] = config[key]
     if config.get("position"):
         params["position"] = config["position"]
-    params["query"] = config["keyword"]
+    keyword = str(config.get("keyword") or "").strip()
+    if keyword:
+        params["query"] = keyword
     return f"{config['base_url']}/web/geek/jobs?{urlencode(params)}"
 
 
@@ -80,6 +83,10 @@ CSV_FIELDS = [
     "城市", "行政区", "商圈", "工作详细地址", "详情链接",
     "公司", "公司阶段", "公司行业", "公司规模", "公司介绍", "公司福利",
 ]
+
+
+class PlatformAccessStopped(InterruptedError):
+    """A platform restriction ends this run and requires a manual restart."""
 
 
 class BossDP:
@@ -153,6 +160,7 @@ class BossDP:
     def __init__(self):
         self.urgent_event=threading.Event()#设置紧急心跳信号
         self.stop_event = threading.Event()
+        self._platform_stop_reason = None
         self.browser_lock=threading.RLock()#心跳线程和主线程共用浏览器
         self._session_lock = threading.RLock()  # requests.Session 与 cookie 同步锁
         self._heartbeat_lock = threading.Lock()
@@ -160,7 +168,7 @@ class BossDP:
         self._last_human_browse_at = None
         self.click_job_count = 0  # 点击职位计数
         self.enter_detail_count = 0  # 进入详细页面计数
-        # 登录态保持开关：开启时 UA 固定 + 持久 profile；关闭时随机 UA（更隐蔽但需重新登录）
+        # 登录态保持开关：开启时 UA 固定 + 持久 profile；关闭时使用临时 profile。
         self.keep_login = Config.get("keep_login", True)
         if self.keep_login:
             os.makedirs(Config["chrome_profile_dir"], exist_ok=True)
@@ -224,6 +232,7 @@ class BossDP:
             co.set_user_data_path(self._browser_profile_dir)
             # 使用 Default profile，确保登录态持久化
             co.set_argument('--profile-directory=Default')
+            co.set_argument('--restore-last-session')
         
         page = ChromiumPage(co)
         page.run_cdp('Page.addScriptToEvaluateOnNewDocument', source='''
@@ -272,8 +281,78 @@ class BossDP:
         return (parsed.netloc == urlparse(Config['base_url']).netloc
                 and parsed.path.startswith(('/web/user/', '/web/common/security')))
 
+    @staticmethod
+    def _is_security_url(url):
+        if not isinstance(url, str):
+            return False
+        parsed = urlparse(url)
+        return (parsed.netloc == urlparse(Config['base_url']).netloc
+                and parsed.path.startswith('/web/common/security'))
+
+    @staticmethod
+    def _platform_message_reason(message):
+        """Inspect explicit error/alert text, never job descriptions or chat history."""
+        if not isinstance(message, str):
+            return None
+        patterns = (
+            (r'(?:操作|访问|请求|点击)(?:过于|太|过)?频繁|频繁操作|请求过多|访问次数过多|'
+             r'too many requests|rate limit', '平台提示操作或请求频繁'),
+            (r'(?:访问|操作|功能|沟通)(?:受限|被限制)|禁止访问|拒绝访问|访问被拒绝|'
+             r'access denied', '平台提示访问或功能受限'),
+            (r'(?:账号|账户|帐号).{0,12}(?:异常|冻结|封禁|封停|停用|限制)',
+             '平台提示账号状态需要检查'),
+            (r'(?:请|需要|需先|必须).{0,12}(?:安全验证|验证码|身份验证|身份核验|人机验证)|'
+             r'(?:安全验证|人机验证|身份核验|验证码)(?:失败|未通过)|环境异常|访问异常|行为异常',
+             '平台要求验证或提示访问环境异常'),
+            (r'登录(?:已)?(?:失效|过期)|登录状态异常|请(?:先|重新)登录|未登录|not logged in',
+             '平台提示登录状态失效'),
+        )
+        for pattern, reason in patterns:
+            if re.search(pattern, message, flags=re.IGNORECASE):
+                return reason
+        return None
+
+    def _mark_platform_stop(self, reason):
+        if not getattr(self, '_platform_stop_reason', None):
+            self._platform_stop_reason = reason
+        for name in ('stop_event', 'urgent_event'):
+            event = getattr(self, name, None)
+            if event is not None:
+                event.set()
+
+    def _raise_if_platform_stopped(self):
+        reason = getattr(self, '_platform_stop_reason', None)
+        if reason:
+            raise PlatformAccessStopped(
+                f'{reason}；本轮已停止。请在官方页面查看提示，处理后手动重新启动任务。'
+            )
+
+    def _stop_for_platform(self, reason):
+        self._mark_platform_stop(reason)
+        self._raise_if_platform_stopped()
+
+    def _check_platform_page(self, page):
+        self._raise_if_platform_stopped()
+        if self._is_security_url(page.url):
+            self._stop_for_platform('页面进入安全验证')
+        if not isinstance(page.url, str) \
+                or urlparse(page.url).netloc != urlparse(Config['base_url']).netloc:
+            return
+        # Restrict text checks to visible alerts, not the full page or JD text.
+        alerts = page.eles(
+            'css:[role="alert"], [role="dialog"], .dialog-container, .toast, .toast-wrap',
+            timeout=0,
+        )
+        if not isinstance(alerts, (list, tuple)):
+            return
+        for alert in alerts:
+            reason = self._platform_message_reason(alert.text)
+            if reason and alert.states.is_displayed:
+                self._stop_for_platform(reason)
+
     def _wait_for_login(self, timeout, start_url=None):
         """Check the rendered avatar, and show an interactive browser only if needed."""
+        self._raise_if_platform_stopped()
         start_url = start_url or Config['start_url']
         started = time.monotonic()
         background_retry = self.browser_background and not getattr(self, '_background_unavailable', False)
@@ -287,6 +366,9 @@ class BossDP:
             while not self.stop_event.is_set():
                 time.sleep(3)
                 with self.browser_lock:
+                    self._raise_if_platform_stopped()
+                    if self._is_security_url(self.page.url):
+                        self._stop_for_platform('登录检查时进入安全验证')
                     logged_in = bool(self.page.ele('.nav-figure', timeout=2))
                     elapsed = time.monotonic() - started
                     if logged_in:
@@ -310,19 +392,24 @@ class BossDP:
                 if elapsed - last_report >= 30:
                     print(f"  仍在等待登录... 已等待 {int(elapsed)} 秒")
                     last_report = elapsed
+            self._raise_if_platform_stopped()
             raise InterruptedError("任务已停止，取消登录等待")
         finally:
             self._login_waiting = False
 
     def _resume_browser_if_needed(self):
         """Consume heartbeat's signal on the main thread, never inside an HTTP request."""
+        self._raise_if_platform_stopped()
         url = getattr(self, '_browser_attention_url', None)
         if url:
+            if self._is_security_url(url):
+                self._stop_for_platform('页面进入安全验证')
             timeout = getattr(self, 'cfg', {}).get('login_wait', 300)
             self._wait_for_login(timeout, start_url=url)
             self.get_cookie_headers()
 
     def _check_browser_attention(self, page):
+        self._check_platform_page(page)
         if self._is_browser_attention_url(page.url):
             self._browser_attention_url = page.url
             self._resume_browser_if_needed()
@@ -410,8 +497,12 @@ class BossDP:
                 parsed = urlparse(current_url)
                 if parsed.netloc != urlparse(Config['base_url']).netloc:
                     return
+                if self._is_security_url(current_url):
+                    self._browser_attention_url = current_url
+                    self._mark_platform_stop('心跳检测到安全验证页面')
+                    return
                 if self._is_browser_attention_url(current_url):
-                    print(" [心跳] 当前为登录或验证页面，等待人工处理")
+                    print(" [心跳] 当前为登录页面，等待人工处理")
                     self._browser_attention_url = current_url
                     return
                 if self.stop_event.is_set():
@@ -419,6 +510,10 @@ class BossDP:
                 if self._is_platform_homepage(current_url):
                     print(" [心跳] 检测到首页，恢复搜索列表")
                     self.page.get(Config['start_url'], retry=0, timeout=5)
+                    if self._is_security_url(self.page.url):
+                        self._browser_attention_url = self.page.url
+                        self._mark_platform_stop('恢复搜索页时进入安全验证')
+                        return
                 if not self.stop_event.is_set():
                     self.get_cookie_headers()
             finally:
@@ -479,7 +574,7 @@ class BossDP:
             "page": page,
             "pageSize": Config["page_size"],
             "city": Config["city_id"],
-            "query": keyword,
+            "query": str(keyword or "").strip(),
             "scene": 1,
         }
         if Config.get("multiBusinessDistrict"):
@@ -495,16 +590,18 @@ class BossDP:
     ):
         """请求 JSON 接口，统一处理网络、HTTP、JSON 和业务错误。"""
         self._resume_browser_if_needed()
-        # 请求间随机延迟，模拟真人操作节奏
+        # Keep the existing request pacing independently of optional browsing.
         delay = random.uniform(1.5, 4.0)
         time.sleep(delay)
         
         for attempt in range(Config["max_retries"]):
+            self._resume_browser_if_needed()
             try:
                 # Read browser cookies before taking the session lock.
                 if not self.current_cookies and not self.get_cookie_headers():
                     raise requests.RequestException("登录态同步失败")
                 with self._session_lock:
+                    self._raise_if_platform_stopped()
                     if self.api_request_count >= self.max_api_requests:
                         print(f"⚠️ 已达到单次最大 API 请求数上限 ({self.max_api_requests})，停止请求")
                         return None
@@ -519,15 +616,30 @@ class BossDP:
                     headers = {**self.current_headers, **(request_headers or {})}
                     response = self.session.request(
                         method, url, headers=headers,
-                        timeout=Config["request_timeout"], **kwargs
+                        timeout=Config["request_timeout"], allow_redirects=False, **kwargs
                     )
+                self._raise_if_platform_stopped()
+                if response.status_code in (401, 403, 429):
+                    self._stop_for_platform(f'接口返回 HTTP {response.status_code}')
+                if 300 <= response.status_code < 400:
+                    target = urljoin(url, response.headers.get('Location', ''))
+                    if self._is_browser_attention_url(target):
+                        self._stop_for_platform('接口要求登录或安全验证')
+                    print(f'{label}接口发生重定向（HTTP {response.status_code}），停止本次请求')
+                    return None
+                if self._is_browser_attention_url(response.url):
+                    self._stop_for_platform('接口进入登录或安全验证页面')
                 if response.status_code != 200:
                     raise requests.RequestException(
                         f"HTTP {response.status_code}"
                     )
                 result = response.json()
                 if result.get("code") != 0:
-                    print(f"{label}接口业务错误: {result.get('message', result.get('msg', '未知错误'))}")
+                    for message in (result.get('message'), result.get('msg')):
+                        reason = self._platform_message_reason(message)
+                        if reason:
+                            self._stop_for_platform(reason)
+                    print(f"{label}接口业务错误，停止本次查询")
                     return None
                 return result
             except (requests.RequestException, ValueError) as exc:
@@ -957,7 +1069,7 @@ class BossDP:
 
     def _begin_human_browse(self):
         """Called under browser_lock; all optional browsing shares one cooldown."""
-        if not getattr(self, 'humanize_enabled', True):
+        if not getattr(self, 'humanize_enabled', True) or getattr(self, '_browser_headless', False):
             return False
         stop_event = getattr(self, 'stop_event', None)
         if stop_event is not None and stop_event.is_set():
@@ -972,7 +1084,7 @@ class BossDP:
         return True
 
     def _human_navigate_interlude(self, job_list):
-        """在主流程安全节点执行一次列表浏览，不修改搜索筛选条件。"""
+        """在可见搜索列表上轻滚一次，所有入口共用冷却时间。"""
         if not getattr(self, 'humanize_enabled', True) or not job_list:
             return
         with self.browser_lock:
@@ -981,35 +1093,13 @@ class BossDP:
                 if not self._begin_human_browse():
                     return
                 started = True
-                action_type = random.choice(['quick_scan', 'scroll_list'])
-
-                if action_type == 'quick_scan':
-                    print(" [拟人浏览] 快速扫描列表")
-                    self.page.scroll.to_top()
-                    time.sleep(random.uniform(0.3, 0.8))
-                    for _ in range(random.randint(8, 15)):
-                        if random.random() < 0.15:
-                            self.page.scroll.up(random.randint(30, 80))
-                            time.sleep(random.uniform(0.2, 0.5))
-                        else:
-                            self.page.scroll.down(random.randint(25, 60))
-                            time.sleep(random.uniform(0.15, 0.4))
-                    time.sleep(random.uniform(1.0, 2.5))
-
-                elif action_type == 'scroll_list':
-                    print(" [拟人浏览] 上下滚动浏览")
-                    for _ in range(random.randint(3, 6)):
-                        direction = random.choice(['down', 'up'])
-                        distance = random.randint(50, 200)
-                        if direction == 'down':
-                            self.page.scroll.down(distance)
-                        else:
-                            self.page.scroll.up(distance)
-                        time.sleep(random.uniform(0.5, 1.5))
-                    time.sleep(random.uniform(1, 2))
-
+                self._check_platform_page(self.page)
+                print(" [轻量浏览] 向下浏览列表")
+                self.page.scroll.down(320)
+            except PlatformAccessStopped:
+                raise
             except Exception as e:
-                print(f"  [拟人浏览] 异常: {e}")
+                print(f"  [轻量浏览] 异常: {e}")
             finally:
                 if started:
                     self._last_human_browse_at = time.monotonic()
@@ -1234,6 +1324,9 @@ class BossDP:
                 self.save_to_csv(Config["output_file"])
         except KeyboardInterrupt:
             print("\n 用户中断")
+            self.save_to_csv(Config["output_file"])
+        except PlatformAccessStopped as exc:
+            print(f"[平台限制] {exc}")
             self.save_to_csv(Config["output_file"])
         except Exception as e:
             print(f" 程序异常: {e}")

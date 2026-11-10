@@ -141,6 +141,7 @@ class DeliveryBrowserSettingsTests(unittest.TestCase):
         deliverer.page = SimpleNamespace(
             get=visits.append,
             url="https://www.zhipin.com/web/geek/chat",
+            eles=Mock(return_value=[]),
         )
         deliverer.browser_lock = threading.RLock()
         deliverer._human_browse_job_list = [{"encryptJobId": "job-1"}]
@@ -185,6 +186,18 @@ class DeliveryBrowserSettingsTests(unittest.TestCase):
 
 
 class SearchSettingsTransmissionTests(unittest.TestCase):
+    def test_browser_start_uses_first_explicit_keyword_without_mutating_input(self):
+        from urllib.parse import parse_qs, urlparse
+
+        config = {"deliver_keyword": "Python  API，AI应用开发", "keep_login": True}
+        spider_config = dict(boss_spider.Config)
+        before = dict(config)
+        with patch.dict(os.environ, {"CITY_CODE": "101280600"}):
+            url = apply_search_settings(config, spider_config)
+        self.assertEqual(spider_config["keyword"], "Python API")
+        self.assertEqual(parse_qs(urlparse(url).query)["query"], ["Python API"])
+        self.assertEqual(config, before)
+
     def test_city_setting_reaches_browser_url_and_job_list_api(self):
         spider_config = dict(boss_spider.Config)
         deliver_config = {
@@ -241,6 +254,30 @@ class SearchSettingsTransmissionTests(unittest.TestCase):
                 "query": ["AI应用开发"],
             },
         )
+
+    def test_empty_keyword_uses_unfiltered_recommendation_request(self):
+        from urllib.parse import parse_qs, urlparse
+
+        spider_config = dict(boss_spider.Config)
+        deliver_config = {
+            "deliver_keyword": "  ",
+            "keep_login": True,
+            "platform_area_filter": [],
+            "platform_job_type": "不限",
+        }
+        spider = boss_spider.BossDP.__new__(boss_spider.BossDP)
+
+        with patch.dict(os.environ, {"CITY_CODE": "101280100"}), \
+                patch.dict(boss_spider.Config, spider_config), \
+                patch.object(spider, "_request_json", return_value={}) as request:
+            browser_url = apply_search_settings(deliver_config, boss_spider.Config)
+            configured_keyword = boss_spider.Config["keyword"]
+            spider.api_job_list(page=1, keyword=deliver_config["deliver_keyword"])
+
+        self.assertEqual(configured_keyword, "")
+        self.assertNotIn("query", parse_qs(urlparse(browser_url).query))
+        self.assertEqual(request.call_args.kwargs["data"]["query"], "")
+        self.assertEqual(request.call_args.kwargs["data"]["scene"], 1)
 
 
 if __name__ == "__main__":

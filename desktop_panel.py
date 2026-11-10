@@ -113,6 +113,7 @@ from platform_search_filters import (
 )
 from platform_locations import fetch_platform_districts, load_city_codes
 from platform_industries import fetch_platform_industries
+from job_platforms import BOSS_ONLY_FIELDS, PAUSED_PLATFORMS, PLATFORM_LABELS, parse_platforms
 
 BASE_DIR = get_data_dir()
 ENV_FILE = BASE_DIR / ".env"
@@ -131,7 +132,8 @@ FIELDS = [
      DEFAULT_GREETING_PROMPT,
      "自定义表达方式、语气和长度；简历、已确认画像与岗位信息会自动附在提示词后。事实仍受系统约束。"),
 
-    ("DELIVER_KEYWORD",  "筛选与简历", "搜索关键词", "text", "", ""),
+    ("JOB_PLATFORMS", "筛选与简历", "招聘平台", "multiselect", "BOSS 直聘", ""),
+    ("DELIVER_KEYWORD",  "筛选与简历", "搜索关键词（可选）", "text", "", "多个词用逗号或分号分隔，分别搜索；空格保留在短语内。留空使用平台推荐"),
     ("CITY_CODE",        "筛选与简历", "在哪个城市找", "select", "101280600", "决定在哪个城市找工作"),
     ("PLATFORM_AREA_FILTER", "筛选与简历", "平台工作区域", "multiselect", "", "区域按当前城市从 BOSS 加载；保存的是平台区域 ID，不选表示不限"),
     ("PLATFORM_JOB_TYPE", "筛选与简历", "平台求职类型", "select", "不限", "平台侧筛选全职、兼职或实习"),
@@ -155,18 +157,20 @@ FIELDS = [
     ("DAILY_LIMIT",   "投递节奏", "每日投递上限", "int", "50", ""),
     ("JOB_DELAY_MIN", "投递节奏", "岗位间隔最小(秒)", "int", "25", ""),
     ("JOB_DELAY_MAX", "投递节奏", "岗位间隔最大(秒)", "int", "50", ""),
-    ("HUMAN_EVERY_N", "投递节奏", "每投N个穿插拟人浏览", "int", "5", "0 = 关闭"),
+    ("HUMAN_EVERY_N", "投递节奏", "每投N个轻量浏览", "int", "5", "0 = 关闭"),
 
-    ("HUMANIZE_ENABLE","拟人行为", "启用拟人浏览", "bool", "true", "关闭额外浏览动作，保留登录信息同步"),
-    ("DETAIL_DELAY_MIN","拟人行为", "详情页停留最小(秒)", "int", "3", "点开岗位/公司页后的浏览时长"),
-    ("DETAIL_DELAY_MAX","拟人行为", "详情页停留最大(秒)", "int", "6", ""),
+    ("HUMANIZE_ENABLE","浏览行为", "启用轻量列表浏览", "bool", "true", "仅可见窗口生效，保留登录信息同步"),
+    ("DETAIL_DELAY_MIN","浏览行为", "详情页停留最小(秒)", "int", "3", "点开岗位/公司页后的浏览时长"),
+    ("DETAIL_DELAY_MAX","浏览行为", "详情页停留最大(秒)", "int", "6", ""),
 
     ("DRY_RUN",    "测试模式", "干跑模式（不真实投递）", "bool", "false", ""),
     ("TEST_LIMIT", "匹配与投递", "本轮 AI 评估岗位数", "int", "0", "完成详情和范围筛选后进入 AI 评估尝试的岗位数量；不足时自动继续翻页补足，最多搜索 50 次；0 = 不限（高级设置决定搜索请求上限）"),
     ("LOGIN_WAIT", "测试模式", "登录等待秒数", "int", "0", "0 = 自动检测登录成功后继续；>0 = 最多等N秒"),
     ("KEEP_LOGIN", "测试模式", "保留登录信息", "bool", "true", "固定UA+持久profile，重启免登录；关闭则每次随机UA需重新登录"),
     ("BROWSER_PATH", "高级设置", "浏览器程序路径", "text", "", "留空自动检测随包 Chromium、Chrome 或 Edge；仅在自动检测失败时填写"),
-    ("BROWSER_BACKGROUND", "高级设置", "浏览器后台运行", "bool", "true", "正常运行不显示窗口；扫码或验证时显示"),
+    ("BROWSER_BACKGROUND", "高级设置", "浏览器后台运行", "bool", "true", "需要扫码时显示窗口；安全验证会停止任务"),
+    ("ZHILIAN_CITY_CODE", "高级设置", "智联城市代码", "text", "", "可填智联搜索地址的 jl 城市代码"),
+    ("LIEPIN_CITY_CODE", "高级设置", "猎聘城市代码", "text", "", "可填猎聘搜索地址的 dqs 城市代码"),
 
     ("TAVILY_ENABLED", "画像搜索", "用 Tavily 补充岗位市场信息", "bool", "true", "仅用于画像访谈追问；不搜索简历，不自动写入候选人技能"),
     ("TAVILY_API_KEY", "画像搜索", "Tavily API Key", "password", "", "仅岗位方向和职位族会发送给 Tavily"),
@@ -174,6 +178,7 @@ FIELDS = [
 ]
 
 SELECT_OPTIONS = {
+    "JOB_PLATFORMS": list(PLATFORM_LABELS.values()),
     "REST_DAY_REQUIRE": ["不限", "双休", "单休", "大小周"],
     "AI_REASONING_EFFORT": ["low", "medium", "high"],
     "JOB_TYPE_PREFERENCE": ["实习", "全职"],
@@ -202,7 +207,7 @@ FIELD_BY_KEY = {field[0]: field for field in FIELDS}
 # 「投递设置」= 用户日常要选/要改的业务参数；「高级设置」= 技术参数。
 SETTINGS_SECTIONS = [
     ("模型接口（必填）", ["AI_BASE_URL", "AI_API_KEY", "AI_MODEL"]),
-    ("简历与目标岗位", ["RESUME_FILE", "DELIVER_KEYWORD"]),
+    ("简历与搜索", ["JOB_PLATFORMS", "RESUME_FILE", "DELIVER_KEYWORD"]),
     ("本轮任务", ["DRY_RUN", "TEST_LIMIT", "MATCH_THRESHOLD", "DAILY_LIMIT"]),
     ("在哪儿找工作", [
         "CITY_CODE", "PLATFORM_AREA_FILTER", "AREA_FILTER",
@@ -218,7 +223,7 @@ SETTINGS_SECTIONS = [
 ]
 ADVANCED_SECTIONS = [
     ("模型细节", ["AI_REASONING_EFFORT", "AI_TIMEOUT", "AI_MAX_RETRIES", "TAVILY_TIMEOUT"]),
-    ("采集细节", ["DELIVER_MAX_PAGES"]),
+    ("采集细节", ["DELIVER_MAX_PAGES", "ZHILIAN_CITY_CODE", "LIEPIN_CITY_CODE"]),
     ("投递节奏", ["JOB_DELAY_MIN", "JOB_DELAY_MAX", "HUMAN_EVERY_N"]),
     ("浏览行为", [
         "HUMANIZE_ENABLE", "DETAIL_DELAY_MIN", "DETAIL_DELAY_MAX",
@@ -232,19 +237,19 @@ WORKFLOW_PAGES = (
 )
 
 PAGE_SUBTITLES = {
-    "求职设置": "填好模型接口、简历与目标岗位即可开始；其余筛选项有合理默认值。",
+    "求职设置": "填好模型接口和简历即可开始；搜索关键词留空时使用平台推荐岗位。",
     "画像查看": "对照查看简历解析出的基础画像与经你确认的增强画像。",
     "增强画像": "可选：通过访谈补齐简历没写到的技能与经历，让 AI 匹配更准。",
     "投递结果": "先看投递状态与匹配分，选中岗位可展开完整评估与证据。",
     "运行日志": "查看任务实时进度、当前岗位与完整输出日志。",
-    "高级设置": "技术参数：超时重试、投递节奏、拟人行为与登录调试，平时不用改。",
+    "高级设置": "技术参数：超时重试、投递节奏、浏览行为与登录调试，平时不用改。",
 }
 DEFAULT_SUBTITLE = "调整求职筛选与自动化任务的运行参数。"
 
 # 分组说明：每个设置分区卡片顶部的一句话解释
 SECTION_HINTS = {
     "模型接口（必填）": "AI 评分与打招呼语都走这个接口，填错了所有任务都会失败。",
-    "简历与目标岗位": "简历决定画像与证据，目标岗位决定搜索关键词。",
+    "简历与搜索": "简历决定匹配证据；关键词留空时从平台推荐岗位中筛选。",
     "本轮任务": "控制这一轮评估多少岗位、投递多少条、是否只做干跑。",
     "在哪儿找工作": "城市、区域与平台侧筛选条件，共同决定抓到哪些岗位。",
     "作息与福利": "与 JD 明确冲突时直接过滤；福利只作为评分加分参考。",
@@ -253,7 +258,7 @@ SECTION_HINTS = {
     "模型细节": "思考强度、超时与重试次数，直接影响速度与费用。",
     "采集细节": "搜索请求预算，目标岗位不足时自动扩大搜索范围。",
     "投递节奏": "岗位之间的等待间隔与穿插浏览频率。",
-    "浏览行为": "停留时长与收藏门槛，用于降低被风控识别的概率。",
+    "浏览行为": "详情页停留时长与可见窗口的轻量列表浏览。",
     "登录与调试": "登录等待与登录态保留方式。",
     "浏览器": "留空自动检测随包 Chromium、Chrome 或 Edge。",
 }
@@ -271,7 +276,6 @@ NAV_ICONS = {
 # 启动前检查项：(显示名, 取值键)
 SETUP_CHECKS = (
     ("AI 接口", "AI_API_KEY"),
-    ("目标岗位", "DELIVER_KEYWORD"),
     ("简历文件", "RESUME_FILE"),
     ("工作城市", "CITY_CODE"),
 )
@@ -368,16 +372,6 @@ def candidate_profile_startup_error(store=None) -> str | None:
         store.load()
     except ValueError as exc:
         return f"候选人画像配置无效：{exc}"
-    return None
-
-
-def target_job_startup_error(target=None) -> str | None:
-    """启动前检查：目标岗位必须填写（岗位画像由系统按目标岗位自动派生）。"""
-    if target is None:
-        target = read_env_dict().get("DELIVER_KEYWORD", "")
-    target = str(target or "").strip()
-    if not target:
-        return "请先在「求职设置」填写目标岗位（例如：AI 应用工程师）后再启动。"
     return None
 
 
@@ -833,7 +827,7 @@ class PanelApp(
     def _build_setup_checklist(self):
         """启动前检查：把「还差什么」直接摆出来，点击可跳到对应输入框。"""
         card = SectionCard(
-            "启动前检查", "这四项填好就能直接启动投递任务，其余筛选项都有默认值。"
+            "启动前检查", "这三项填好就能直接启动投递任务，其余筛选项都有默认值。"
         )
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -958,6 +952,15 @@ class PanelApp(
                 check.setParent(host)
                 flow.addWidget(check)
                 checks.append((option, check))
+                if key == "JOB_PLATFORMS":
+                    check.toggled.connect(self._update_platform_controls)
+                    platform = next(name for name, label in PLATFORM_LABELS.items() if label == option)
+                    if platform in PAUSED_PLATFORMS:
+                        check.setText(f"{option}（已暂停）")
+                        check.setToolTip(PAUSED_PLATFORMS[platform])
+                        check.setEnabled(False)
+                    elif option != PLATFORM_LABELS["boss"]:
+                        check.setToolTip("试验接入，尚未完成真实账号端到端验证")
             if key == "PLATFORM_AREA_FILTER":
                 self.platform_area_flow = flow
                 self.platform_area_choices = checks
@@ -1207,6 +1210,11 @@ class PanelApp(
             if ftype == "bool":
                 widget.setChecked(val.strip().lower() == "true")
             elif ftype == "multiselect":
+                if key == "JOB_PLATFORMS":
+                    try:
+                        val = ",".join(PLATFORM_LABELS[item] for item in parse_platforms(val))
+                    except ValueError:
+                        pass
                 selected = [item.strip() for item in val.split(",") if item.strip()]
                 if key == "PLATFORM_AREA_FILTER":
                     self.pending_platform_area_values = selected
@@ -1233,7 +1241,8 @@ class PanelApp(
             else:
                 widget.setText(val)
         self._loading_env = False
-        platform_type = self.vars["PLATFORM_JOB_TYPE"][0].currentText().strip()
+        platform_type = self.vars["PLATFORM_JOB_TYPE"][0].currentText().strip() \
+            if "boss" in self._selected_platforms() else "不限"
         preference = self.vars["JOB_TYPE_PREFERENCE"][0].currentText().strip()
         remembered = preference
         if platform_type in ("实习", "全职", "兼职"):
@@ -1255,7 +1264,44 @@ class PanelApp(
         self._refresh_digest_status()
         self._refresh_field_hints()
         self._refresh_setup_checks()
+        self._update_platform_controls()
         self._refresh_platform_areas()
+
+    def _selected_platforms(self):
+        selected = [option for option, check in self.multiselect_checks.get("JOB_PLATFORMS", [])
+                    if check.isChecked()]
+        try:
+            return parse_platforms(selected)
+        except ValueError:
+            return []
+
+    def _update_platform_controls(self, *_args):
+        if self._loading_env:
+            return
+        for option, check in self.multiselect_checks.get("JOB_PLATFORMS", []):
+            platform = next(name for name, label in PLATFORM_LABELS.items() if label == option)
+            if platform in PAUSED_PLATFORMS:
+                check.setEnabled(check.isChecked())
+        boss_enabled = "boss" in self._selected_platforms()
+        for key in BOSS_ONLY_FIELDS:
+            block = self.field_blocks.get(key)
+            if block is not None:
+                block.setEnabled(boss_enabled)
+                block.setToolTip("BOSS 直聘筛选条件" if boss_enabled else "仅适用于 BOSS 直聘")
+        for key, platform in (("ZHILIAN_CITY_CODE", "zhilian"), ("LIEPIN_CITY_CODE", "liepin")):
+            block = self.field_blocks.get(key)
+            if block is not None:
+                block.setEnabled(platform in self._selected_platforms() and platform not in PAUSED_PLATFORMS)
+        if "JOB_TYPE_PREFERENCE" in self.vars:
+            platform_type = self.vars["PLATFORM_JOB_TYPE"][0].currentText() if boss_enabled else "不限"
+            if platform_type != self._last_platform_job_type:
+                self._on_platform_job_type_changed(platform_type)
+            self._update_job_type_preference_control(platform_type)
+        if not boss_enabled and hasattr(self, "platform_area_refresh"):
+            self.location_generation += 1
+            self.platform_area_refresh.setEnabled(False)
+        elif boss_enabled and hasattr(self, "platform_area_refresh"):
+            self.platform_area_refresh.setEnabled(True)
 
     def _on_platform_job_type_changed(self, platform_type):
         if self._loading_env:
@@ -1495,6 +1541,10 @@ class PanelApp(
         self._refresh_platform_areas()
 
     def _refresh_platform_areas(self, *_args):
+        if "boss" not in self._selected_platforms():
+            self.platform_area_status.setText("BOSS 直聘区域")
+            self.platform_area_refresh.setEnabled(False)
+            return
         city_code = self._current_city_code()
         if city_code and city_code == self.location_city_code:
             if self.platform_area_choices:
@@ -1725,7 +1775,7 @@ class PanelApp(
             else:
                 values[key] = widget.text().strip()
         values["JOB_TYPE_PREFERENCE"] = normalize_job_type_preference(
-            values.get("PLATFORM_JOB_TYPE", "不限"),
+            values.get("PLATFORM_JOB_TYPE", "不限") if "boss" in self._selected_platforms() else "不限",
             values.get("JOB_TYPE_PREFERENCE", "实习"),
         )
         return values
@@ -2118,11 +2168,6 @@ class PanelApp(
         values = self._collect_values()
         if values is None:
             return
-        jobs_error = target_job_startup_error(values.get("DELIVER_KEYWORD"))
-        if jobs_error:
-            QMessageBox.warning(self, "需要先填写目标岗位", jobs_error)
-            self._show_page("求职设置")
-            return
         if CandidateProfileStore().load() is None:
             self.append_log(
                 f"[面板] {time.strftime('%H:%M:%S')} 未确认候选人画像，将按基础画像运行"
@@ -2212,6 +2257,10 @@ class PanelApp(
                 self._set_widget_style(self.status_dot, "statusDotIdle")
                 self._set_widget_style(self.run_state_chip, "statusChipWarn")
                 self.run_state_chip.setText("已中断")
+            elif exit_code == 3:
+                self._set_widget_style(self.status_dot, "statusDotIdle")
+                self._set_widget_style(self.run_state_chip, "statusChipWarn")
+                self.run_state_chip.setText("平台限制")
             else:
                 self._set_widget_style(self.status_dot, "statusDotIdle")
                 self._set_widget_style(self.run_state_chip, "statusChipWarn")

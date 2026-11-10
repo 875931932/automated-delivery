@@ -150,6 +150,21 @@ class JobDeduplicationTests(unittest.TestCase):
         self.assertEqual(deliverer._filter_jobs([self.listing("same-job")]), [])
         self.assertEqual(len(deliverer._filter_jobs([self.listing("different-job")])), 1)
 
+    def test_manual_application_records_result_without_consuming_daily_quota(self):
+        deliverer = self.make_deliverer(dry_run=False)
+        deliverer.deliver_one = Mock(return_value="manual_required")
+        deliverer.api_job_list = Mock(return_value={
+            "zpData": {"jobList": [self.listing("manual-job")]},
+        })
+
+        deliverer._run_profiled_pipeline()
+
+        self.assertEqual(deliverer.tracker.data["count"], 0)
+        self.assertEqual(deliverer.deliver_count, 0)
+        self.assertEqual(deliverer.results[0]["投递状态"], "manual_required")
+        self.assertEqual(deliverer.results[0]["AI匹配分数"], 88)
+        self.assertIn("官方岗位页", deliverer.results[0]["筛选原因"])
+
     def test_contacted_detail_never_reaches_scoring_or_greeting(self):
         for container, action in (
             ("job-op", '<a class="btn-startchat">已沟通</a>'),
@@ -212,6 +227,7 @@ class JobDeduplicationTests(unittest.TestCase):
     def test_late_contact_status_is_checked_after_detail_content_loads(self):
         deliverer = self.make_deliverer()
         tab = SimpleNamespace(
+            url="https://www.zhipin.com/job_detail/late-job.html",
             wait=SimpleNamespace(doc_loaded=Mock()), eles=Mock(return_value=[]),
             ele=Mock(side_effect=[SimpleNamespace(text="负责 Python 后端开发。"), None]),
         )

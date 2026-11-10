@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Literal
@@ -50,7 +51,7 @@ class JobProfile(BaseModel):
     name: str
     enabled: bool = True
     role_family_id: str = ""
-    search_keywords: list[str] = Field(min_length=1)
+    search_keywords: list[str] = Field(default_factory=list)
     role_direction: str = ""
     diagnostic_terms: list[str] = Field(default_factory=list)
     hard_requirements: list[RequirementGroup] = Field(default_factory=list)
@@ -69,10 +70,9 @@ class JobProfile(BaseModel):
     @field_validator("search_keywords")
     @classmethod
     def clean_keywords(cls, values: list[str]) -> list[str]:
-        cleaned = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
-        if not cleaned:
-            raise ValueError("at least one search keyword is required")
-        return cleaned
+        return list(dict.fromkeys(
+            str(value).strip() for value in values if str(value).strip()
+        ))
 
     @field_validator("diagnostic_terms", "preferred_qualifications", "exclusions")
     @classmethod
@@ -151,12 +151,33 @@ def eligible_profiles(
     ]
 
 
+def normalize_search_keyword(value: str) -> str:
+    return " ".join(str(value or "").split())
+
+
+def parse_search_keywords(value: str) -> list[str]:
+    """Split explicit alternatives without breaking phrases or technical names."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    keywords = {}
+    for part in re.split(r"[,，;；\r\n]+", text):
+        keyword = normalize_search_keyword(part)
+        if keyword:
+            keywords.setdefault(keyword.casefold(), keyword)
+    if not keywords:
+        raise ValueError("搜索关键词只有分隔符；请填写岗位词，或清空以使用平台推荐。")
+    if len(keywords) > 50:
+        raise ValueError("唯一搜索关键词不能超过 50 个，请精简关键词。")
+    return list(keywords.values())
+
+
 def build_unique_queries(profiles: list[JobProfile]) -> list[dict]:
     queries: list[dict] = []
     by_normalized: dict[str, dict] = {}
     for profile in profiles:
         for raw_keyword in profile.search_keywords:
-            keyword = str(raw_keyword or "").strip()
+            keyword = normalize_search_keyword(raw_keyword)
             if not keyword:
                 continue
             normalized = keyword.casefold()

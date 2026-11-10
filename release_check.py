@@ -7,6 +7,54 @@ import tempfile
 from pathlib import Path
 
 
+def _check_runtime_controls():
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    from boss_spider import BossDP, Config, PlatformAccessStopped
+
+    spider = BossDP.__new__(BossDP)
+    spider.browser_lock = threading.RLock()
+    spider._session_lock = threading.RLock()
+    spider.stop_event = threading.Event()
+    spider.urgent_event = threading.Event()
+    spider.humanize_enabled = True
+    spider._browser_headless = False
+    spider._last_human_browse_at = None
+    spider._platform_stop_reason = None
+    spider.page = SimpleNamespace(
+        url=Config["start_url"], scroll=Mock(), eles=Mock(return_value=[]),
+    )
+    with patch("boss_spider.time.monotonic", return_value=100):
+        spider._human_navigate_interlude([{"encryptJobId": "offline-job"}])
+        spider._human_navigate_interlude([{"encryptJobId": "offline-job"}])
+    spider.page.scroll.down.assert_called_once_with(320)
+    spider.page.scroll.up.assert_not_called()
+    spider.page.scroll.to_top.assert_not_called()
+    spider.page.scroll.reset_mock()
+    spider._browser_headless = True
+    spider._last_human_browse_at = None
+    spider._human_navigate_interlude([{"encryptJobId": "offline-job"}])
+    assert not spider.page.scroll.mock_calls, "Headless browsing must not scroll"
+
+    spider.current_cookies = {"offline": "fixture"}
+    spider.current_headers = {}
+    spider.api_request_count = 0
+    spider.max_api_requests = 5
+    spider.session = SimpleNamespace(request=Mock(return_value=SimpleNamespace(status_code=429)))
+    with patch("boss_spider.time.sleep"):
+        for keyword in ("first", "second"):
+            try:
+                spider.api_job_list(keyword=keyword)
+            except PlatformAccessStopped:
+                pass
+            else:
+                raise AssertionError("A restricted request must stop the run")
+    spider.session.request.assert_called_once()
+    assert spider.stop_event.is_set(), "Platform restriction must stop heartbeat"
+
+
 def run_release_check(report_path, *, gui):
     report_path = Path(report_path).resolve()
     report = {"ok": False, "frozen": bool(getattr(sys, "frozen", False)), "gui": gui}
@@ -47,6 +95,9 @@ def run_release_check(report_path, *, gui):
             recorder._saved_count = 0
             recorder._record(recorder._result_row({"encryptJobId": "offline-job"}, 80, "offline", "dry_run"))
             assert recorder._load_processed_job_ids(recorder.cfg["result_file"], dry_run=True) == {"offline-job"}
+            _check_runtime_controls()
+            report["light_browsing_ok"] = True
+            report["platform_stop_ok"] = True
             try:
                 browser_path = resolve_browser_path()
                 report["browser"] = browser_path.name
@@ -101,6 +152,18 @@ def run_release_check(report_path, *, gui):
                     shot.parent.mkdir(parents=True, exist_ok=True)
                     assert window.grab().save(str(shot)), "Screenshot failed"
                     report["screenshot"] = str(shot)
+                    window.runner.exit_code = 3
+                    window._poll()
+                    assert window.run_state_chip.text() == "平台限制", "Platform stop state missing"
+                    assert "平台限制" in window.status_label.text(), "Platform stop status missing"
+                    report["platform_stop_ui_ok"] = True
+                    window.runner.exit_code = None
+                    window._poll()
+                    window._show_page("高级设置")
+                    app.processEvents()
+                    advanced_shot = report_path.with_name(report_path.stem + "-advanced.png")
+                    assert window.grab().save(str(advanced_shot)), "Advanced settings screenshot failed"
+                    report["advanced_screenshot"] = str(advanced_shot)
                     from panel_about import AboutDialog
                     about = AboutDialog(window)
                     about.show()

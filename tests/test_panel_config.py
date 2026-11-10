@@ -43,6 +43,17 @@ class ParseHhmmTests(unittest.TestCase):
 
 
 class ValidateConfigValuesTests(unittest.TestCase):
+    def test_multiple_keywords_and_recommendation_mode_are_valid(self):
+        for keyword in ("", "Python API；AI应用开发,python api"):
+            with self.subTest(keyword=keyword):
+                self.assertEqual(validate_config_values(valid_values(DELIVER_KEYWORD=keyword)), [])
+
+    def test_invalid_keyword_list_is_reported_before_start(self):
+        for keyword in ("，；;", ";".join(f"term-{i}" for i in range(51))):
+            with self.subTest(keyword=keyword):
+                errors = validate_config_values(valid_values(DELIVER_KEYWORD=keyword))
+                self.assertTrue(any("搜索关键词" in error for error in errors))
+
     def test_valid_config_has_no_errors(self):
         self.assertEqual(validate_config_values(valid_values(), resume_exists=True), [])
 
@@ -149,7 +160,7 @@ class PanelSettingTransmissionTests(unittest.TestCase):
             [title for title, _keys in assignments["SETTINGS_SECTIONS"]],
             [
                 "模型接口（必填）",
-                "简历与目标岗位",
+                "简历与搜索",
                 "本轮任务",
                 "在哪儿找工作",
                 "作息与福利",

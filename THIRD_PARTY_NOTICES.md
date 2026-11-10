@@ -12,6 +12,7 @@ Key components and upstream sources:
 | PySide6 / Qt for Python | 6.12.0 | https://code.qt.io/cgit/pyside/pyside-setup.git/ |
 | Qt | 6.12.0 | https://download.qt.io/archive/qt/ |
 | DrissionPage | 4.1.1.4 | https://github.com/g1879/DrissionPage |
+| psutil | 7.2.2 | https://github.com/giampaolo/psutil |
 | LangChain | 1.3.12 | https://github.com/langchain-ai/langchain |
 | langchain-openai | 1.3.4 | https://github.com/langchain-ai/langchain |
 | requests | 2.33.1 | https://github.com/psf/requests |

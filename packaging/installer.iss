@@ -1,4 +1,4 @@
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #ifndef DistDir
   #define DistDir SourcePath + "..\dist\AutoDeliver"
 #endif

@@ -35,6 +35,7 @@ FILTER_TAGS = (
 
 _ERROR_MARKERS = (
     "traceback", "程序异常", "配置错误", "失败", "异常", "错误", "error", "exception",
+    "[平台限制]",
 )
 
 _JOB_LINE_RE = re.compile(

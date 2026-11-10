@@ -20,7 +20,7 @@ class ResultRecorder:
         completed = {
             "delivered", "already_contacted", "below_threshold", "out_of_scope",
             "prefilter_reject", "role_reject", "role_rejected", "condition_rejected",
-            "area_rejected", "hard_rejected", "local_gate_rejected",
+            "area_rejected", "hard_rejected", "local_gate_rejected", "delivery_unconfirmed",
         }
         if dry_run:
             completed.update({"dry_run", "dry_run_ready"})
@@ -92,6 +92,10 @@ class ResultRecorder:
                 writer.writeheader()
                 for old in old_rows:
                     row = {field: old.get(field, "") for field in RESULT_FIELDS}
+                    if not row.get("平台"):
+                        row["平台"] = "BOSS 直聘"
+                    if not row.get("平台岗位ID"):
+                        row["平台岗位ID"] = old.get("encryptJobId", "")
                     if "匹配分数" in old:
                         if old.get("投递状态") == "prefilter_reject":
                             row["预筛命中率"] = old.get("匹配分数", "")
@@ -125,6 +129,8 @@ class ResultRecorder:
             jd_requirements = _format_jd_requirements(jd_requirements)
 
         return {
+            "平台": job.get("平台", "BOSS 直聘"),
+            "平台岗位ID": job.get("平台岗位ID", job.get("encryptJobId", "")),
             "encryptJobId": job.get("encryptJobId", ""),
             "工作名称": job.get("工作名称", ""),
             "公司": job.get("公司", ""),

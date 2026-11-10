@@ -153,6 +153,14 @@ _JOB_SCORING_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "你是岗位匹配评估员。遵循传入的通用筛选规则，对每个岗位画像分别评分。"
+            "地点意向以本次任务求职城市（系统设置）为准，优先于简历、结构化摘要、已确认画像"
+            "及通用筛选规则中的旧地点偏好；全国表示本轮不限求职城市。"
+            "设置了本次城市时，不得因旧地点偏好扣分、降低role_fit或confidence、判定不合格，"
+            "也不得据此输出不符合求职意向、hard_gaps或disqualification_reason。"
+            "未提供本次城市时沿用已有地点偏好，不得自行假定用户选择了其他城市或全国。"
+            "岗位实际地点与本次设置的真实地点冲突仍应如实指出；地点不明只能标为待确认。"
+            "本次城市只更新地点意向，不改变简历事实或其他约束，不证明用户已在当地居住，"
+            "不得推断到岗时间、搬迁安排、通勤能力或已满足其他工作条件，也不能作为能力证据。"
             "必须为每个画像恰好返回一个结果，不能依据搜索来源省略画像。"
             "先按岗位标题和核心职责识别职业职能，不预设候选人只求职软件或技术岗位；"
             "仅在岗位实际职责或明确要求涉及技术时评估技术技能，其他职业按其职责、资格和可迁移证据评估。"
@@ -187,6 +195,7 @@ _JOB_SCORING_PROMPT = ChatPromptTemplate.from_messages(
         ),
         (
             "human",
+            "本次任务求职城市（系统设置）:\n{target_city}\n\n"
             "通用筛选规则:\n{rules}\n\n"
             "岗位画像(JSON数组，每个都必须单独评估):\n{profiles}\n\n"
             "用户确认的候选人画像(JSON，仅包含确认信息):\n{candidate_profile}\n\n"
@@ -433,6 +442,7 @@ class JobScoringChain:
         profiles: list[JobProfile],
         rules: str,
         prompt_resume: str | None = None,
+        target_city: str | None = None,
     ) -> JobMatchResponse:
         if not str(rules or "").strip():
             raise ValueError("screening rules are required")
@@ -441,6 +451,7 @@ class JobScoringChain:
             raise ValueError("job profile IDs must be non-empty and unique")
         try:
             response = self.chain.invoke({
+                "target_city": str(target_city or "").strip() or "未提供（沿用已有地点偏好）",
                 "rules": rules,
                 # 只传评分需要的字段，去掉 search_keywords/diagnostic_terms 等无关内容省 token
                 "profiles": json.dumps(

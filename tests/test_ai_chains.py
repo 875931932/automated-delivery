@@ -423,6 +423,67 @@ def _assessment(profile_id="backend"):
 
 
 class JobScoringChainTests(unittest.TestCase):
+    def test_current_city_is_separate_from_resume_and_profile_preferences(self):
+        resume = "求职城市：深圳。使用 Python 开发后端接口"
+        candidate = _candidate().model_copy(update={"preferences": ["只考虑深圳"]})
+        for target_city in ("上海", "杭州", "全国", "深圳"):
+            for use_digest in (False, True):
+                with self.subTest(city=target_city, digest=use_digest):
+                    captured = []
+                    chain = JobScoringChain(model=RunnableLambda(
+                        lambda prompt: captured.extend(prompt.to_messages()) or AIMessage(
+                            content=json.dumps({"profile_results": [_assessment()]}, ensure_ascii=False)
+                        )
+                    ))
+                    prompt_resume = "结构化摘要：求职城市：深圳。使用 Python 开发后端接口"
+                    result = chain.invoke(
+                        resume=resume,
+                        prompt_resume=prompt_resume if use_digest else None,
+                        candidate_profile=candidate,
+                        job={"工作名称": "Python 后端工程师", "区域": "上海"},
+                        profiles=_profiles(),
+                        rules="优先考虑深圳岗位。",
+                        target_city=target_city,
+                    )
+
+                    system, human = captured
+                    self.assertIn("优先于", system.content)
+                    self.assertIn("全国表示本轮不限求职城市", system.content)
+                    self.assertIn("不得因旧地点偏好扣分", system.content)
+                    self.assertIn("真实地点冲突", system.content)
+                    self.assertIn("不得推断到岗时间", system.content)
+                    self.assertIn(f"本次任务求职城市（系统设置）:\n{target_city}\n\n", human.content)
+                    self.assertIn("只考虑深圳", human.content)
+                    self.assertIn(prompt_resume if use_digest else resume, human.content)
+                    self.assertEqual(candidate.preferences, ["只考虑深圳"])
+                    self.assertEqual(
+                        result.profile_results[0].evidence[0].evidence_text,
+                        "使用 Python 开发后端接口",
+                    )
+
+    def test_missing_city_does_not_invent_a_current_preference(self):
+        for target_city in (None, "", "   "):
+            with self.subTest(city=target_city):
+                captured = []
+                chain = JobScoringChain(model=RunnableLambda(
+                    lambda prompt: captured.extend(prompt.to_messages()) or AIMessage(
+                        content=json.dumps({"profile_results": [_assessment()]}, ensure_ascii=False)
+                    )
+                ))
+                chain.invoke(
+                    resume="求职城市：深圳。使用 Python 开发后端接口",
+                    candidate_profile=_candidate(),
+                    job={"工作名称": "Python 后端工程师"},
+                    profiles=_profiles(),
+                    rules="规则",
+                    target_city=target_city,
+                )
+
+                self.assertIn(
+                    "本次任务求职城市（系统设置）:\n未提供（沿用已有地点偏好）\n\n",
+                    captured[1].content,
+                )
+
     def test_scoring_extracts_institution_tier_as_a_distinct_requirement(self):
         response = {
             "profile_results": [_assessment()],

@@ -12,7 +12,7 @@ $metadata = Get-Content -LiteralPath (Join-Path $workspace 'author_info.json') -
 $shortcutDir = Join-Path ([Environment]::GetFolderPath('Programs')) $metadata.app_name
 $userData = Join-Path $env:APPDATA 'AutoDeliver'
 if (-not $Installer) {
-    $Installer = Join-Path $workspace 'release\AutoDeliver-Setup-1.0.0-win64.exe'
+    $Installer = Join-Path $workspace ("release\AutoDeliver-Setup-{0}-win64.exe" -f $metadata.version)
 }
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 if (-not $installDir.StartsWith($workspace + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -75,6 +75,7 @@ try {
     $registeredDir = [IO.Path]::GetFullPath($registration.InstallLocation).TrimEnd('\')
     if ($registeredDir -ne $installDir) { throw "Unexpected registered install location: $registeredDir" }
     if ($registration.Publisher -ne 'Gnahz') { throw 'Installer author metadata is incorrect.' }
+    if ($registration.DisplayVersion -ne $metadata.version) { throw 'Installed version does not match application metadata.' }
     if (-not (Test-Path -LiteralPath (Join-Path $shortcutDir ($metadata.app_name + '.lnk')))) {
         throw 'Start Menu shortcut was not created.'
     }

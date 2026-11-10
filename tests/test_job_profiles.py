@@ -12,6 +12,7 @@ from job_profiles import (
     build_unique_queries,
     eligible_profiles,
     load_screening_rules,
+    parse_search_keywords,
 )
 
 
@@ -51,11 +52,10 @@ class JobProfileModelTests(unittest.TestCase):
         self.assertEqual(item.hard_requirements[0].mode, "any")
         self.assertEqual(item.hard_requirements[0].options, ["C++", "Python", "Java"])
 
-    def test_invalid_threshold_and_empty_keywords_are_rejected(self):
+    def test_invalid_threshold_is_rejected_and_empty_search_keywords_are_allowed(self):
         with self.assertRaises(ValueError):
             profile("backend", "后端开发", threshold=101)
-        with self.assertRaises(ValueError):
-            profile("backend", " ")
+        self.assertEqual(profile("recommendations", " ").search_keywords, [])
 
     def test_only_enabled_profiles_bound_to_confirmed_families_are_eligible(self):
         profiles = [
@@ -106,6 +106,29 @@ class JobProfileStoreTests(unittest.TestCase):
 
 
 class JobProfileQueryTests(unittest.TestCase):
+    def test_explicit_alternatives_preserve_phrases_and_merge_duplicates(self):
+        self.assertEqual(
+            parse_search_keywords(" AI应用开发，Python   API;python api；RAG\nC++/C#开发,AI应用开发 "),
+            ["AI应用开发", "Python API", "RAG", "C++/C#开发"],
+        )
+        self.assertEqual(parse_search_keywords('Python OR Java'), ['Python OR Java'])
+
+    def test_blank_keywords_select_recommendations_but_separators_are_invalid(self):
+        self.assertEqual(parse_search_keywords(" \t\r\n"), [])
+        with self.assertRaisesRegex(ValueError, "只有分隔符"):
+            parse_search_keywords(",，;；\n")
+
+    def test_keyword_limit_counts_unique_normalized_terms(self):
+        values = [f"keyword-{index}" for index in range(50)]
+        self.assertEqual(parse_search_keywords(";".join(values * 2)), values)
+        with self.assertRaisesRegex(ValueError, "不能超过 50"):
+            parse_search_keywords(";".join(values + ["extra"]))
+
+    def test_phrase_whitespace_merges_profile_provenance(self):
+        self.assertEqual(build_unique_queries([
+            profile("one", "Python  API"), profile("two", "python API"),
+        ]), [{"keyword": "Python API", "profile_ids": ["one", "two"]}])
+
     def test_duplicate_keywords_merge_profile_provenance(self):
         profiles = [profile("one", "Python后端"), profile("two", " python后端 ")]
 

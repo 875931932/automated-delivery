@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """投递结果页纯逻辑：筛选/排序/状态着色/详情 HTML/人工标记写回。"""
 import csv
+import hashlib
 import html
+import io
 import json
 import os
+import tempfile
+import time
+from collections import Counter
+from pathlib import Path
 
 from delivery_config import RESULT_FIELDS
 
@@ -31,6 +37,8 @@ STATUS_DISPLAY = {
     "match_failed": ("评分失败", *_RED),
     "greeting_failed": ("招呼失败", *_RED),
     "failed": ("投递失败", *_RED),
+    "delivery_unconfirmed": ("投递待核对", *_YELLOW),
+    "manual_required": ("需人工投递", *_YELLOW),
 }
 
 _REJECT_MARKERS = ("reject", "fail", "rejected", "failed")
@@ -72,7 +80,7 @@ def summarize_result_rows(rows) -> dict[str, int]:
         "total": len(statuses),
         "delivered": sum(status == "delivered" for status in statuses),
         "dry_run": sum(status in {"dry_run", "dry_run_ready"} for status in statuses),
-        "review": sum(status == "scope_review" for status in statuses),
+        "review": sum(status in {"scope_review", "delivery_unconfirmed", "manual_required"} for status in statuses),
         "failed": sum("fail" in status for status in statuses),
     }
 
@@ -96,11 +104,13 @@ def filter_result_rows(rows, status="全部", score_min=0, score_max=100,
     for row in rows:
         if status and status != "全部" and row.get("投递状态", "").strip() != status:
             continue
-        if review_only and row.get("职业范围状态", "").strip() != "scope_review":
+        if review_only and row.get("职业范围状态", "").strip() != "scope_review" \
+                and row.get("投递状态", "").strip() not in {"delivery_unconfirmed", "manual_required"}:
             continue
         if keyword:
             haystack = (
                 row.get("工作名称", "") + "\n" + row.get("公司", "")
+                + "\n" + row.get("平台", "")
             ).lower()
             if keyword not in haystack:
                 continue
@@ -138,6 +148,84 @@ def deduplicate_result_rows(rows) -> list:
                     merged[field] = row.get(field, "")
             result[index] = merged
     return result
+
+
+def read_result_snapshot(path) -> tuple[list, str]:
+    """Read rows and a fingerprint of the exact file displayed by the panel."""
+    data = Path(path).read_bytes()
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+    return list(reader), hashlib.sha256(data).hexdigest()
+
+
+def delete_result_rows(path, selected_rows, *, expected_digest=None) -> tuple[int, str | None]:
+    """Delete job histories, matching ID-less records by full content and count.
+
+    Preserve original columns and back up exact bytes before atomic replacement.
+    """
+    selected_rows = list(selected_rows)
+    if not selected_rows:
+        return 0, None
+    path = Path(path)
+    original = path.read_bytes()
+    if expected_digest is not None and hashlib.sha256(original).hexdigest() != expected_digest:
+        raise ValueError("结果文件已变化，请刷新后重新选择要删除的记录。")
+    reader = csv.DictReader(
+        io.StringIO(original.decode("utf-8-sig"), newline=""), strict=True,
+    )
+    rows = list(reader)
+    fields = reader.fieldnames or []
+    if len(fields) != len(set(fields)) or any(
+        None in row or any(value is None for value in row.values()) for row in rows
+    ):
+        raise ValueError("结果文件的列结构异常，未执行删除，请先检查 CSV 文件。")
+    job_ids = {str(row.get("encryptJobId", "") or "").strip() for row in selected_rows}
+    job_ids.discard("")
+    idless = [row for row in selected_rows if not str(row.get("encryptJobId", "") or "").strip()]
+    if any(not set(fields).issubset(row) for row in idless):
+        raise ValueError("无岗位 ID 的记录内容不完整，请刷新后重新选择。")
+    remaining_matches = Counter(tuple(row[field] for field in fields) for row in idless)
+    kept = []
+    for row in rows:
+        job_id = str(row.get("encryptJobId", "") or "").strip()
+        if job_id and job_id in job_ids:
+            continue
+        key = tuple(row[field] for field in fields)
+        if not job_id and remaining_matches[key]:
+            remaining_matches[key] -= 1
+            continue
+        kept.append(row)
+    removed = len(rows) - len(kept)
+    if not removed:
+        return 0, None
+
+    with tempfile.NamedTemporaryFile(
+        mode="wb", dir=path.parent,
+        prefix=f"{path.name}.delete-{time.strftime('%Y%m%d-%H%M%S')}-",
+        suffix=".bak", delete=False,
+    ) as backup:
+        backup.write(original)
+        backup.flush()
+        os.fsync(backup.fileno())
+        backup_path = backup.name
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8-sig", newline="", dir=path.parent,
+            prefix=f"{path.name}.delete-", suffix=".tmp", delete=False,
+        ) as output:
+            temp_path = output.name
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(kept)
+            output.flush()
+            os.fsync(output.fileno())
+        if path.read_bytes() != original:
+            raise ValueError("结果文件在删除期间发生变化，未执行删除，请刷新后重新选择。")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+    return removed, backup_path
 
 
 def update_result_mark(path, job_id, mark) -> int:
@@ -340,7 +428,7 @@ def build_result_detail_html(row: dict) -> str:
 
     meta_bits = []
     for key, label in (
-        ("encryptJobId", "岗位 ID"), ("工作性质", "工作性质"), ("区域", "工作地点"),
+        ("平台", "招聘平台"), ("encryptJobId", "岗位 ID"), ("工作性质", "工作性质"), ("区域", "工作地点"),
         ("上班时间", "上班时间"), ("休息制度", "休息制度"), ("主岗位画像", "主岗位画像"),
         ("职业范围状态", "职业范围状态"), ("人工标记", "人工标记"),
         ("投递时间", "记录时间"), ("来源岗位画像", "来源岗位画像"),

@@ -3,6 +3,8 @@
 import re
 
 from platform_search_filters import PLATFORM_FILTERS, resolve_platform_filter
+from job_platforms import ensure_platform_available, parse_platforms, platform_city_code
+from job_profiles import parse_search_keywords
 
 HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -61,15 +63,33 @@ def validate_config_values(values: dict, resume_exists=True) -> list:
     resume_exists: 简历文件是否存在（由调用方注入，保持纯函数）。
     """
     errors = []
+    try:
+        parse_search_keywords(values.get("DELIVER_KEYWORD", ""))
+    except ValueError as exc:
+        errors.append(str(exc))
+    platforms = ["boss"]
+    try:
+        platforms = parse_platforms(values.get("JOB_PLATFORMS"))
+        for platform in platforms:
+            ensure_platform_available(platform)
+            if platform != "boss":
+                platform_city_code(platform, {
+                    "city_code": values.get("CITY_CODE", "101280600"),
+                    f"{platform}_city_code": values.get(f"{platform.upper()}_CITY_CODE", ""),
+                })
+    except ValueError as exc:
+        errors.append(str(exc))
     rest_day = str(values.get("REST_DAY_REQUIRE", "不限") or "不限").strip()
     if rest_day not in {"不限", "双休", "单休", "大小周"}:
         errors.append(f"「休息制度」不是支持的选项：{rest_day}")
     for env_key, (_config_key, _param_key, codes) in PLATFORM_FILTERS.items():
+        if "boss" not in platforms:
+            continue
         raw = str(values.get(env_key, "") or "").strip()
         if raw and raw != "不限" and not resolve_platform_filter(env_key, raw):
             errors.append(f"「{env_key}」不是支持的平台筛选值：{raw}")
     industry = str(values.get("PLATFORM_INDUSTRY", "") or "").strip()
-    if industry and not resolve_platform_filter("PLATFORM_INDUSTRY", industry):
+    if "boss" in platforms and industry and not resolve_platform_filter("PLATFORM_INDUSTRY", industry):
         errors.append("「平台行业 ID」需要是数字 ID（多个用逗号分隔），或包含 industry 参数的 BOSS 搜索链接")
     for key, label in (
         ("WORK_TIME_START", "最早可接受上班时间"),
